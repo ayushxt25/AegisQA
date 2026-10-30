@@ -1,0 +1,2 @@
+# Playwright 1.48 supports Python 3.8 and provides the Chromium runtime used here.
+playwright==1.48.0

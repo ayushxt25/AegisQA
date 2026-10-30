@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated experiment evidence
+artifacts/
+
+# Tooling
+.pytest_cache/
+.coverage
