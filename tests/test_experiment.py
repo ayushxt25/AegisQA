@@ -4,9 +4,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from experiment import DEFAULT_FIXTURE, run_experiment
+try:
+    import playwright.sync_api  # noqa: F401
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+else:
+    PLAYWRIGHT_AVAILABLE = True
+
+if PLAYWRIGHT_AVAILABLE:
+    from experiment import DEFAULT_FIXTURE, run_experiment
 
 
+@unittest.skipUnless(PLAYWRIGHT_AVAILABLE, "Playwright is not installed")
 class BrowserExperimentSmokeTest(unittest.TestCase):
     def test_local_fixture_interaction_creates_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -57,7 +57,7 @@ def run_agent_experiment(artifacts_dir: Path = DEFAULT_ARTIFACTS) -> int:
                     page = context.new_page()
                     runner = AgentRunner(
                         planner=MockPlanner(fixture_url),
-                        browser=PlaywrightBrowserTool(page),
+                        browser=PlaywrightBrowserTool(page, policy),
                         policy=policy,
                         assertion_evaluator=fixture_assertion,
                     )
