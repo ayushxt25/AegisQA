@@ -26,13 +26,24 @@ def fixture_assertion(observation: Observation) -> bool:
 
 
 class FakeBrowser:
-    def __init__(self, result: str = "Clicks: 0") -> None:
+    def __init__(self, result: str = "Clicks: 0", url: str = "about:blank", elements=None) -> None:
         self.result = result
+        self.url = url
+        self.elements = elements
+        self.executed_actions = []
 
     def observe(self) -> Observation:
-        return Observation("browser", {"result": self.result})
+        elements = self.elements
+        if elements is None:
+            elements = [] if self.url == "about:blank" else [
+                {"selector": "#increment", "available": True, "visible": True, "enabled": True}
+            ]
+        return Observation("browser", {"result": self.result, "url": self.url, "permitted_elements": elements})
 
     def execute(self, action: BrowserAction) -> Observation:
+        self.executed_actions.append(action)
+        if action.kind is ActionKind.NAVIGATE:
+            self.url = action.target
         if action.kind is ActionKind.CLICK and action.target == "#increment":
             self.result = "Clicks: 1"
         return Observation("browser_action", {"kind": action.kind.value})
@@ -104,3 +115,34 @@ class AgentRuntimeTest(unittest.TestCase):
         self.assertEqual(state.status, ExecutionStatus.SUCCEEDED)
         with self.assertRaises(RuntimeError):
             state.start()
+
+    def test_click_on_about_blank_is_rejected_before_execution(self) -> None:
+        browser = FakeBrowser()
+        result = run(StaticPlanner(BrowserAction(ActionKind.CLICK, "#increment")), browser)
+        self.assertEqual(result.state.status, ExecutionStatus.FAILED)
+        self.assertIn("current page is not an approved", result.state.error)
+        self.assertEqual(browser.executed_actions, [])
+
+    def test_missing_hidden_and_disabled_targets_are_rejected(self) -> None:
+        for element, expected in (
+            ({"selector": "#increment", "available": False}, "unavailable"),
+            ({"selector": "#increment", "available": True, "visible": False, "enabled": True}, "not visible"),
+            ({"selector": "#increment", "available": True, "visible": True, "enabled": False}, "not enabled"),
+        ):
+            with self.subTest(expected=expected):
+                browser = FakeBrowser(url=FIXTURE_URL, elements=[element])
+                result = run(StaticPlanner(BrowserAction(ActionKind.CLICK, "#increment")), browser)
+                self.assertEqual(result.state.status, ExecutionStatus.FAILED)
+                self.assertIn(expected, result.state.error)
+                self.assertEqual(browser.executed_actions, [])
+
+    def test_permitted_available_element_executes(self) -> None:
+        browser = FakeBrowser(url=FIXTURE_URL)
+        result = run(StaticPlanner(BrowserAction(ActionKind.CLICK, "#increment")), browser)
+        self.assertEqual(result.state.status, ExecutionStatus.SUCCEEDED)
+        self.assertEqual(len(browser.executed_actions), 1)
+
+    def test_mock_planner_still_succeeds_with_runtime_validation(self) -> None:
+        result = run(MockPlanner(FIXTURE_URL))
+        self.assertEqual(result.state.status, ExecutionStatus.SUCCEEDED)
+        self.assertTrue(result.state.assertion_result)

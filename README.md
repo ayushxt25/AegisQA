@@ -32,3 +32,15 @@ After setup, run:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## Optional Gemini planner (P0.3B)
+
+Mock planning remains the default. Gemini execution is explicit and requires `GEMINI_API_KEY` plus Python 3.9 or newer for the optional Google SDK.
+
+```powershell
+$env:GEMINI_API_KEY = "your-key"
+$env:AEGISQA_MODEL = "gemini-2.5-flash-lite"
+python agent_experiment.py --planner gemini
+```
+
+See `docs/phase-0-p0.3b-gemini-planner.md` for bounds, costs, and limitations.

@@ -14,6 +14,40 @@ from .state import ExecutionState, ExecutionStatus, Observation
 AssertionEvaluator = Callable[[Observation], bool]
 
 
+def validate_runtime_action(
+    action: BrowserAction, policy: ActionPolicy, observation: Observation
+) -> None:
+    """Confirm that an authorized click/fill is feasible in the latest observation."""
+    if action.kind not in (ActionKind.CLICK, ActionKind.FILL):
+        return
+    data = observation.data
+    if data.get("url") not in policy.allowed_urls:
+        raise ActionValidationError(
+            "Runtime action rejected: current page is not an approved navigation target."
+        )
+    elements = data.get("permitted_elements")
+    if not isinstance(elements, list):
+        raise ActionValidationError(
+            "Runtime action rejected: permitted element observation is unavailable."
+        )
+    element = next(
+        (item for item in elements if isinstance(item, dict) and item.get("selector") == action.target),
+        None,
+    )
+    if element is None or element.get("available") is not True:
+        raise ActionValidationError(
+            "Runtime action rejected: target is unavailable in the latest observation."
+        )
+    if element.get("visible") is not True:
+        raise ActionValidationError(
+            "Runtime action rejected: target is not visible in the latest observation."
+        )
+    if element.get("enabled") is not True:
+        raise ActionValidationError(
+            "Runtime action rejected: target is not enabled in the latest observation."
+        )
+
+
 @dataclass(frozen=True)
 class ExecutionResult:
     state: ExecutionState
@@ -73,6 +107,7 @@ class AgentRunner:
                 break
             try:
                 validate_action(action, self.policy)
+                validate_runtime_action(action, self.policy, latest)
             except ActionValidationError as error:
                 state.fail("Action rejected: {0}".format(error))
                 break

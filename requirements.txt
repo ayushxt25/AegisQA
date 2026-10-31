@@ -1,2 +1,4 @@
 # Playwright 1.48 supports Python 3.8 and provides the Chromium runtime used here.
 playwright==1.48.0
+# Current Google Gen AI SDK releases require Python 3.9+; mock mode remains Python 3.8-compatible.
+google-genai>=1.33.0,<3.0.0; python_version >= "3.9"
