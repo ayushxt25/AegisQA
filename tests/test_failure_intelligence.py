@@ -15,6 +15,13 @@ from failure_intelligence.classifier import (
     TrustedAssertionContract,
     TrustedInfrastructureContext,
 )
+from failure_intelligence.synthetic_evaluation import (
+    build_adversarial_scenarios,
+    build_scenarios,
+    classify_scenario,
+    evaluate_scenarios,
+    normalized_evaluation_json,
+)
 
 
 FIXED_TIME = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
@@ -262,3 +269,48 @@ class DeterministicClassifierTest(unittest.TestCase):
         left = self.classifier.classify(event, (action, assertion), contract)
         right = self.classifier.classify(event, (assertion, action), contract)
         self.assertEqual(left, right)
+
+
+class SyntheticEvaluationTest(unittest.TestCase):
+    def test_scenario_construction_has_all_six_execution_only_inputs(self):
+        scenarios = build_scenarios()
+        self.assertEqual(tuple(item.scenario_id for item in scenarios), ("F01", "F02", "F03", "F04", "F05", "F06"))
+        self.assertTrue(all(not hasattr(item, "expected_category") for item in scenarios))
+        self.assertIsNotNone(scenarios[2].assertion_contract)
+        self.assertIsNotNone(scenarios[3].infrastructure_context)
+        self.assertEqual(len(scenarios[4].repeated_attempts), 2)
+        self.assertEqual(scenarios[5].evidence, ())
+
+    def test_ground_truth_is_joined_only_after_classifier_execution(self):
+        scenario = build_scenarios()[2]
+        result = classify_scenario(scenario)
+        self.assertEqual(result.finding.classification, FailureCategory.APPLICATION_DEFECT)
+        report = evaluate_scenarios()
+        self.assertEqual(report["results"][2]["scenario_id"], "F03")
+        self.assertTrue(report["results"][2]["category_match"])
+
+    def test_evaluation_metrics_are_measured_from_classifier_results(self):
+        report = evaluate_scenarios()
+        self.assertEqual(report["metrics"], {
+            "accuracy": 1.0,
+            "confidence_level_agreement": 1.0,
+            "false_application_defect_count": 0,
+            "insufficient_evidence_handling": {"correct": 1, "expected": 1, "rate": 1.0},
+            "scenario_count": 6,
+        })
+
+    def test_normalized_evaluation_output_is_deterministic(self):
+        scenarios = build_scenarios()
+        self.assertEqual(normalized_evaluation_json(scenarios), normalized_evaluation_json(reversed(scenarios)))
+
+    def test_adversarial_evidence_cannot_produce_verified_application_defect(self):
+        scenarios = build_adversarial_scenarios()
+        self.assertEqual(len(scenarios), 6)
+        for scenario in scenarios:
+            result = classify_scenario(scenario)
+            self.assertFalse(
+                result.finding.classification is FailureCategory.APPLICATION_DEFECT
+                and result.finding.confidence is ConfidenceLevel.VERIFIED,
+                scenario.scenario_id,
+            )
+            self.assertEqual(result.applied_rule_id, "R01")
