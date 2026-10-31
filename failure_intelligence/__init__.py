@@ -13,9 +13,20 @@ from .contracts import (
     ReproducibilityStatus,
     SanitizationStatus,
 )
+from .classifier import (
+    ClassificationResult,
+    DeterministicClassifier,
+    InjectedCondition,
+    RepeatedAttempt,
+    TrustedAssertionContract,
+    TrustedInfrastructureContext,
+)
 
 __all__ = [
     "ConfidenceLevel",
+    "ClassificationResult",
+    "DeterministicClassifier",
+    "InjectedCondition",
     "EvidenceIdFactory",
     "EvidenceRecord",
     "EvidenceSource",
@@ -25,5 +36,8 @@ __all__ = [
     "InvestigationFinding",
     "InvestigationReport",
     "ReproducibilityStatus",
+    "RepeatedAttempt",
     "SanitizationStatus",
+    "TrustedAssertionContract",
+    "TrustedInfrastructureContext",
 ]
