@@ -1,5 +1,6 @@
 """Focused real-browser checks for the P0.4C Playwright evidence collector."""
 
+from http.client import HTTPConnection
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,13 +12,43 @@ except ImportError:
 else:
     PLAYWRIGHT_AVAILABLE = True
 
-from failure_intelligence.browser_collector import ARTIFACT_ROOT, PROJECT_ROOT, collect_browser_evidence
-from failure_intelligence.contracts import EvidenceSource, FailureStage
+from failure_intelligence.browser_collector import (
+    ARTIFACT_ROOT,
+    BrowserCollectionError,
+    PROJECT_ROOT,
+    Loopback503Server,
+    collect_browser_evidence,
+)
+from failure_intelligence.classifier import DeterministicClassifier
+from failure_intelligence.contracts import ConfidenceLevel, EvidenceSource, FailureCategory, FailureStage
 from failure_intelligence.manifests import ExecutionManifest, F05RepeatPlan, ManifestActionPolicy, ScenarioId
 
 
 def attempts(prefix):
     return tuple("{0}_{1:02d}".format(prefix, number) for number in range(1, 11))
+
+
+class Loopback503ServerTest(unittest.TestCase):
+    def test_server_binds_to_loopback_and_returns_only_the_configured_503_route(self):
+        try:
+            server_context = Loopback503Server("/service-unavailable")
+        except BrowserCollectionError:
+            self.skipTest("Loopback sockets are unavailable in this environment")
+        with server_context as server:
+            host, port = server.server.server_address[:2]
+            self.assertEqual(host, "127.0.0.1")
+            connection = HTTPConnection(host, port, timeout=1)
+            try:
+                connection.request("GET", "/service-unavailable")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 503)
+                response.close()
+                connection.request("GET", "/not-configured")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 404)
+                response.close()
+            finally:
+                connection.close()
 
 
 @unittest.skipUnless(PLAYWRIGHT_AVAILABLE, "Playwright is not installed")
@@ -35,6 +66,16 @@ class BrowserCollectorTest(unittest.TestCase):
             timeout_ms=1_000,
             fixture_path=fixture_path,
             f05_repeat_plan=repeat_plan,
+        )
+
+    def f04_manifest(self, run_id):
+        return ExecutionManifest(
+            scenario_id=ScenarioId.F04,
+            run_id=run_id,
+            artifact_directory="artifacts/p0.4c/{0}".format(run_id),
+            action_policy=ManifestActionPolicy(allowed_urls=(), allowed_click_targets=()),
+            timeout_ms=1_000,
+            server_route="/service-unavailable",
         )
 
     def collect(self, scenario_id, fixture_path, repeat_plan=None):
@@ -89,6 +130,29 @@ class BrowserCollectorTest(unittest.TestCase):
             self.assertTrue(result.assertion_passed)
             self.assertEqual(result.evidence[-1].observed_facts["status"], "assertion_passed")
             self.assertEqual(len(result.evidence), 3)
+
+    def test_f04_loopback_503_collects_network_evidence_and_classifies_with_context(self):
+        ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="collector-", dir=str(ARTIFACT_ROOT)) as temporary_directory:
+            run_id = Path(temporary_directory).name
+            result = collect_browser_evidence(self.f04_manifest(run_id), PROJECT_ROOT)
+            network = result.evidence[0]
+            self.assertEqual(result.failure_event.stage, FailureStage.ENVIRONMENT)
+            self.assertEqual((network.source, network.producing_component), (EvidenceSource.NETWORK, "http_server"))
+            self.assertEqual(network.observed_facts["http_status"], 503)
+            self.assertTrue(network.observed_facts["url"].startswith("http://127.0.0.1:"))
+            self.assertTrue(network.verify_digest())
+            self.assertIsNotNone(result.infrastructure_context)
+            classified = DeterministicClassifier().classify(
+                result.failure_event, result.evidence, infrastructure_context=result.infrastructure_context,
+            )
+            self.assertEqual(
+                (classified.applied_rule_id, classified.finding.classification, classified.finding.confidence),
+                ("R03", FailureCategory.INFRASTRUCTURE_FAILURE, ConfidenceLevel.VERIFIED),
+            )
+            serialized = (result.artifact_directory / "evidence.json").read_text(encoding="utf-8")
+            self.assertNotIn("Content-Length", serialized)
+            self.assertNotIn("Server:", serialized)
 
 
 if __name__ == "__main__":

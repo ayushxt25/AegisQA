@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
+from time import perf_counter
 from typing import Optional, Sequence, Tuple
 
 from agent_runtime.actions import ActionKind, ActionPolicy, BrowserAction, ActionValidationError, validate_action
@@ -19,6 +22,7 @@ from .contracts import (
     FailureStage,
     canonical_json,
 )
+from .classifier import InjectedCondition, TrustedInfrastructureContext
 from .manifests import ExecutionManifest, ScenarioId
 
 
@@ -37,6 +41,54 @@ class BrowserCollectionResult:
     evidence: Tuple[EvidenceRecord, ...]
     artifact_directory: Path
     assertion_passed: Optional[bool]
+    infrastructure_context: Optional[TrustedInfrastructureContext] = None
+
+
+class _ServiceUnavailableHandler(BaseHTTPRequestHandler):
+    """Local deterministic endpoint; no request/response data is persisted."""
+
+    def do_GET(self):  # noqa: N802 - stdlib handler API name
+        if self.path != self.route:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(503)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+class Loopback503Server:
+    """Bounded lifecycle for the F04 loopback-only service failure injection."""
+
+    def __init__(self, route: str) -> None:
+        self.route = route
+        handler = type("_ConfiguredServiceUnavailableHandler", (_ServiceUnavailableHandler,), {"route": route})
+        try:
+            self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        except OSError as error:
+            raise BrowserCollectionError("Unable to start the loopback HTTP server.") from error
+        self.server.daemon_threads = True
+        self.thread = Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+
+    @property
+    def url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return "http://{0}:{1}{2}".format(host, port, self.route)
+
+    def __enter__(self) -> "Loopback503Server":
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=1.0)
+        self.server.server_close()
+        if self.thread.is_alive() and exc_type is None:
+            raise BrowserCollectionError("Loopback server did not stop within its bounded shutdown timeout.")
 
 
 def _action_policy(manifest: ExecutionManifest) -> ActionPolicy:
@@ -113,16 +165,74 @@ def _write_artifacts(directory: Path, evidence: Sequence[EvidenceRecord], event:
     (directory / "failure-event.json").write_text(canonical_json(event.to_dict()), encoding="utf-8")
 
 
+def _collect_f04(
+    manifest: ExecutionManifest, artifact_directory: Path, factory: EvidenceIdFactory,
+) -> BrowserCollectionResult:
+    """Navigate Chromium to a local injected 503 and record status-only network evidence."""
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError as error:
+        raise BrowserCollectionError("Playwright is not installed.") from error
+
+    evidence = []
+    browser = None
+    context = None
+    try:
+        with Loopback503Server(manifest.server_route) as server:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True, timeout=manifest.timeout_ms)
+                context = browser.new_context()
+                context.set_default_timeout(manifest.timeout_ms)
+                context.set_default_navigation_timeout(manifest.timeout_ms)
+                page = context.new_page()
+                started_at = perf_counter()
+                response = page.goto(server.url, wait_until="commit", timeout=manifest.timeout_ms)
+                duration_ms = int((perf_counter() - started_at) * 1000)
+                if response is None or response.status != 503:
+                    raise BrowserCollectionError("Loopback service did not return the expected HTTP status.")
+                evidence.append(factory.create(EvidenceSource.NETWORK, "http_server", {
+                    "duration_ms": duration_ms,
+                    "http_status": 503,
+                    "timeout_ms": manifest.timeout_ms,
+                    "url": server.url,
+                }))
+    except PlaywrightError as error:
+        raise BrowserCollectionError("Playwright browser collection failed.") from error
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    event = FailureEvent(
+        failure_id="failure_f04", run_id=manifest.run_id, occurred_at=evidence[0].captured_at,
+        stage=FailureStage.ENVIRONMENT, observed_facts={"status": "failed"},
+        evidence_ids=tuple(record.evidence_id for record in evidence),
+    )
+    infrastructure_context = TrustedInfrastructureContext(
+        "context_{0}".format(manifest.run_id), manifest.run_id, InjectedCondition.SIMULATED_HTTP_503,
+    )
+    _write_artifacts(artifact_directory, evidence, event)
+    return BrowserCollectionResult(event, tuple(evidence), artifact_directory, None, infrastructure_context)
+
+
 def collect_browser_evidence(
     manifest: ExecutionManifest, project_root: Path = PROJECT_ROOT,
 ) -> BrowserCollectionResult:
     """Collect one bounded local fixture run without invoking classification or an LLM."""
-    if manifest.scenario_id is ScenarioId.F04:
-        raise BrowserCollectionError("F04 requires the later local HTTP server implementation.")
     artifact_directory = _artifact_directory(manifest, project_root)
+    factory = EvidenceIdFactory(run_id=manifest.run_id)
+    if manifest.scenario_id is ScenarioId.F04:
+        return _collect_f04(manifest, artifact_directory, factory)
     fixture_url = _fixture_url(manifest, project_root)
     policy = _action_policy(manifest)
-    factory = EvidenceIdFactory(run_id=manifest.run_id)
     evidence = []
     assertion_passed: Optional[bool] = None
 
