@@ -18,6 +18,7 @@ from failure_intelligence.browser_collector import (
     PROJECT_ROOT,
     Loopback503Server,
     collect_browser_evidence,
+    collect_f05_repeated_trials,
 )
 from failure_intelligence.classifier import DeterministicClassifier
 from failure_intelligence.contracts import ConfidenceLevel, EvidenceSource, FailureCategory, FailureStage
@@ -153,6 +154,41 @@ class BrowserCollectorTest(unittest.TestCase):
             serialized = (result.artifact_directory / "evidence.json").read_text(encoding="utf-8")
             self.assertNotIn("Content-Length", serialized)
             self.assertNotIn("Server:", serialized)
+
+    def test_f05_repeat_protocol_keeps_groups_isolated_and_uses_actual_outcomes(self):
+        ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="boundary-", dir=str(ARTIFACT_ROOT)) as boundary_directory:
+            with tempfile.TemporaryDirectory(prefix="control-", dir=str(ARTIFACT_ROOT)) as control_directory:
+                boundary_run_id = Path(boundary_directory).name
+                control_run_id = Path(control_directory).name
+                plan = F05RepeatPlan(
+                    boundary_run_id, control_run_id, attempts("boundary"), attempts("control"), "boundary_profile_v1",
+                )
+                result = collect_f05_repeated_trials(
+                    self.manifest(ScenarioId.F05, "fixture/p0.4c/delayed-result.html", boundary_run_id, plan),
+                    PROJECT_ROOT,
+                )
+                self.assertEqual(len(result.control_trials), 10)
+                self.assertEqual(len(result.boundary_trials), 10)
+                self.assertNotEqual(result.control_event.run_id, result.boundary_event.run_id)
+                self.assertEqual({record.run_id for record in result.boundary_evidence}, {boundary_run_id})
+                self.assertEqual({record.run_id for record in result.control_evidence}, {control_run_id})
+                self.assertEqual(len({record.evidence_id for record in result.boundary_evidence}), len(result.boundary_evidence))
+                self.assertEqual(
+                    [record.evidence_id for record in result.boundary_evidence],
+                    ["ev_{0}_{1:06d}".format(boundary_run_id, index)
+                     for index in range(1, len(result.boundary_evidence) + 1)],
+                )
+                self.assertEqual(set(result.boundary_event.evidence_ids),
+                                 {record.evidence_id for record in result.boundary_evidence})
+                self.assertTrue(all(trial.assertion_duration_ms is not None for trial in result.boundary_trials))
+                self.assertEqual(len(result.repeated_attempts), 10)
+                self.assertEqual(
+                    {attempt.evidence_ids[0] for attempt in result.repeated_attempts},
+                    {trial.assertion_evidence_id for trial in result.boundary_trials},
+                )
+                self.assertTrue((Path(boundary_directory) / "f05-results.json").is_file())
+                self.assertTrue((Path(control_directory) / "f05-results.json").is_file())
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from statistics import median
 from threading import Thread
 from time import perf_counter
 from typing import Optional, Sequence, Tuple
@@ -22,13 +23,22 @@ from .contracts import (
     FailureStage,
     canonical_json,
 )
-from .classifier import InjectedCondition, TrustedInfrastructureContext
+from .classifier import (
+    ClassificationResult,
+    DeterministicClassifier,
+    InjectedCondition,
+    RepeatedAttempt,
+    TrustedInfrastructureContext,
+)
 from .manifests import ExecutionManifest, ScenarioId
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_ROOT = PROJECT_ROOT / "artifacts" / "p0.4c"
 ASSERTION_TIMEOUT_MS = 1_000
+F05_ASSERTION_TIMEOUT_MS = 100
+F05_CONTROL_DELAY_MS = 0
+F05_BOUNDARY_DELAYS_MS = (25, 300, 25, 300, 25, 300, 25, 300, 25, 300)
 
 
 class BrowserCollectionError(RuntimeError):
@@ -42,6 +52,71 @@ class BrowserCollectionResult:
     artifact_directory: Path
     assertion_passed: Optional[bool]
     infrastructure_context: Optional[TrustedInfrastructureContext] = None
+
+
+@dataclass(frozen=True)
+class F05TrialMeasurement:
+    attempt_id: str
+    injected_delay_ms: int
+    action_duration_ms: Optional[int]
+    assertion_duration_ms: Optional[int]
+    assertion_passed: Optional[bool]
+    assertion_evidence_id: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "action_duration_ms": self.action_duration_ms,
+            "assertion_duration_ms": self.assertion_duration_ms,
+            "assertion_evidence_id": self.assertion_evidence_id,
+            "assertion_passed": self.assertion_passed,
+            "attempt_id": self.attempt_id,
+            "injected_delay_ms": self.injected_delay_ms,
+        }
+
+
+@dataclass(frozen=True)
+class F05EvaluationResult:
+    control_event: FailureEvent
+    boundary_event: FailureEvent
+    control_evidence: Tuple[EvidenceRecord, ...]
+    boundary_evidence: Tuple[EvidenceRecord, ...]
+    control_trials: Tuple[F05TrialMeasurement, ...]
+    boundary_trials: Tuple[F05TrialMeasurement, ...]
+    repeated_attempts: Tuple[RepeatedAttempt, ...]
+    classification: ClassificationResult
+
+    @staticmethod
+    def _metrics(trials: Sequence[F05TrialMeasurement]) -> dict:
+        completed = [trial for trial in trials if trial.assertion_passed is not None]
+        durations = [trial.assertion_duration_ms for trial in completed if trial.assertion_duration_ms is not None]
+        return {
+            "attempts": len(trials),
+            "completed": len(completed),
+            "failed": sum(trial.assertion_passed is False for trial in completed),
+            "passed": sum(trial.assertion_passed is True for trial in completed),
+            "assertion_duration_ms": {
+                "max": max(durations) if durations else None,
+                "median": median(durations) if durations else None,
+                "min": min(durations) if durations else None,
+            },
+        }
+
+    def to_dict(self) -> dict:
+        return {
+            "boundary": {"metrics": self._metrics(self.boundary_trials),
+                         "run_id": self.boundary_event.run_id,
+                         "trials": [trial.to_dict() for trial in self.boundary_trials]},
+            "classification": {"applied_rule_id": self.classification.applied_rule_id,
+                               "finding": self.classification.finding.to_dict()},
+            "control": {"metrics": self._metrics(self.control_trials),
+                        "run_id": self.control_event.run_id,
+                        "trials": [trial.to_dict() for trial in self.control_trials]},
+            "repeated_attempts": [
+                {"assertion_passed": attempt.assertion_passed, "attempt_id": attempt.attempt_id,
+                 "evidence_ids": list(attempt.evidence_ids), "equivalence_key": attempt.equivalence_key}
+                for attempt in self.repeated_attempts
+            ],
+        }
 
 
 class _ServiceUnavailableHandler(BaseHTTPRequestHandler):
@@ -318,3 +393,190 @@ def collect_browser_evidence(
     )
     _write_artifacts(artifact_directory, evidence, event)
     return BrowserCollectionResult(event, tuple(evidence), artifact_directory, assertion_passed)
+
+
+def _group_artifact_directory(project_root: Path, run_id: str) -> Path:
+    target = (project_root / "artifacts" / "p0.4c" / run_id).resolve()
+    root = (project_root / "artifacts" / "p0.4c").resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise BrowserCollectionError("F05 artifact directory is outside the P0.4C artifact root.") from error
+    return target
+
+
+def _run_f05_trial(
+    browser, fixture_url: str, policy: ActionPolicy, factory: EvidenceIdFactory,
+    attempt_id: str, profile: str, delay_ms: int, timeout_ms: int,
+) -> Tuple[F05TrialMeasurement, Tuple[EvidenceRecord, ...]]:
+    """Run one fresh-context F05 trial and record only actual browser outcomes."""
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    evidence = []
+    context = None
+    action_duration_ms = None
+    assertion_duration_ms = None
+    assertion_passed = None
+    assertion_evidence_id = None
+    try:
+        context = browser.new_context()
+        context.set_default_timeout(timeout_ms)
+        context.set_default_navigation_timeout(timeout_ms)
+        page = context.new_page()
+        page.goto(fixture_url, wait_until="load", timeout=timeout_ms)
+        page.evaluate(
+            "config => window.aegisqaConfigureRenderingDelay(config.profile, config.delayMs)",
+            {"profile": profile, "delayMs": delay_ms},
+        )
+        observation = PlaywrightBrowserTool(page, policy).observe()
+        evidence.append(factory.create(EvidenceSource.OBSERVATION, "browser", _safe_observation_facts(observation)))
+        action = BrowserAction(ActionKind.CLICK, "#increment")
+        try:
+            validate_action(action, policy)
+            validate_runtime_action(action, policy, observation)
+        except ActionValidationError:
+            evidence.append(factory.create(EvidenceSource.ACTION, "runner", {
+                "action_kind": action.kind.value, "error": "validation_rejected", "selector": action.target,
+            }))
+        else:
+            started_at = perf_counter()
+            page.locator(action.target).click(timeout=timeout_ms)
+            action_duration_ms = int((perf_counter() - started_at) * 1000)
+            evidence.append(factory.create(EvidenceSource.ACTION, "runner", {
+                "action_kind": action.kind.value, "duration_ms": action_duration_ms,
+                "outcome": "executed", "selector": action.target,
+            }))
+            started_at = perf_counter()
+            try:
+                page.wait_for_function(
+                    "document.getElementById('result').textContent === 'Clicks: 1'",
+                    timeout=F05_ASSERTION_TIMEOUT_MS,
+                )
+                assertion_passed = True
+            except PlaywrightTimeoutError:
+                assertion_passed = False
+            assertion_duration_ms = int((perf_counter() - started_at) * 1000)
+            assertion = factory.create(EvidenceSource.EXECUTION_LOG, "assertion", {
+                "duration_ms": assertion_duration_ms,
+                "injected_delay_ms": delay_ms,
+                "status": "assertion_passed" if assertion_passed else "assertion_failed",
+                "timeout_ms": F05_ASSERTION_TIMEOUT_MS,
+            })
+            evidence.append(assertion)
+            assertion_evidence_id = assertion.evidence_id
+    except PlaywrightError:
+        evidence.append(factory.create(EvidenceSource.ACTION, "runner", {
+            "action_kind": "click", "error": "execution_failed", "selector": "#increment",
+        }))
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+    return (
+        F05TrialMeasurement(
+            attempt_id=attempt_id, injected_delay_ms=delay_ms, action_duration_ms=action_duration_ms,
+            assertion_duration_ms=assertion_duration_ms, assertion_passed=assertion_passed,
+            assertion_evidence_id=assertion_evidence_id,
+        ),
+        tuple(evidence),
+    )
+
+
+def _f05_event(run_id: str, evidence: Sequence[EvidenceRecord], group: str) -> FailureEvent:
+    completed = any(record.observed_facts.get("status") == "assertion_passed" for record in evidence)
+    return FailureEvent(
+        failure_id="failure_f05_{0}".format(group), run_id=run_id,
+        occurred_at=evidence[-1].captured_at, stage=FailureStage.ASSERTION,
+        observed_facts={"status": "completed" if completed else "failed"},
+        evidence_ids=tuple(record.evidence_id for record in evidence),
+    )
+
+
+def _write_f05_report(directory: Path, group: str, trials: Sequence[F05TrialMeasurement],
+                      classification: Optional[ClassificationResult] = None) -> None:
+    payload = {"group": group, "trials": [trial.to_dict() for trial in trials]}
+    if classification is not None:
+        payload["classification"] = {
+            "applied_rule_id": classification.applied_rule_id,
+            "finding": classification.finding.to_dict(),
+        }
+    (directory / "f05-results.json").write_text(canonical_json(payload), encoding="utf-8")
+
+
+def collect_f05_repeated_trials(
+    manifest: ExecutionManifest, project_root: Path = PROJECT_ROOT,
+) -> F05EvaluationResult:
+    """Run the fixed F05 control/boundary protocol and classify observed boundary outcomes."""
+    if manifest.scenario_id is not ScenarioId.F05 or manifest.f05_repeat_plan is None:
+        raise BrowserCollectionError("F05 repeated trials require an F05 execution manifest.")
+    plan = manifest.f05_repeat_plan
+    if len(F05_BOUNDARY_DELAYS_MS) != len(plan.boundary_attempt_ids):
+        raise BrowserCollectionError("F05 boundary schedule does not match the manifest attempt count.")
+    artifact_directory = _artifact_directory(manifest, project_root)
+    control_directory = _group_artifact_directory(project_root, plan.control_run_id)
+    fixture_url = _fixture_url(manifest, project_root)
+    policy = _action_policy(manifest)
+    boundary_factory = EvidenceIdFactory(run_id=manifest.run_id)
+    control_factory = EvidenceIdFactory(run_id=plan.control_run_id)
+
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError as error:
+        raise BrowserCollectionError("Playwright is not installed.") from error
+
+    control_trials = []
+    boundary_trials = []
+    control_evidence = []
+    boundary_evidence = []
+    browser = None
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True, timeout=manifest.timeout_ms)
+            for attempt_id in plan.control_attempt_ids:
+                trial, records = _run_f05_trial(
+                    browser, fixture_url, policy, control_factory, attempt_id, "control",
+                    F05_CONTROL_DELAY_MS, manifest.timeout_ms,
+                )
+                control_trials.append(trial)
+                control_evidence.extend(records)
+            for attempt_id, delay_ms in zip(plan.boundary_attempt_ids, F05_BOUNDARY_DELAYS_MS):
+                trial, records = _run_f05_trial(
+                    browser, fixture_url, policy, boundary_factory, attempt_id, "boundary",
+                    delay_ms, manifest.timeout_ms,
+                )
+                boundary_trials.append(trial)
+                boundary_evidence.extend(records)
+    except PlaywrightError as error:
+        raise BrowserCollectionError("Playwright browser collection failed.") from error
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    control_event = _f05_event(plan.control_run_id, control_evidence, "control")
+    boundary_event = _f05_event(manifest.run_id, boundary_evidence, "boundary")
+    candidate_attempts = tuple(
+        RepeatedAttempt(trial.attempt_id, plan.equivalence_key, trial.assertion_passed, (trial.assertion_evidence_id,))
+        for trial in boundary_trials
+        if trial.assertion_passed is not None and trial.assertion_evidence_id is not None
+    )
+    repeated_attempts = candidate_attempts if len(candidate_attempts) == len(plan.boundary_attempt_ids) else ()
+    classification = DeterministicClassifier().classify(
+        boundary_event, tuple(boundary_evidence), repeated_attempts=repeated_attempts,
+    )
+    _write_artifacts(control_directory, control_evidence, control_event)
+    _write_artifacts(artifact_directory, boundary_evidence, boundary_event)
+    _write_f05_report(control_directory, "control", control_trials)
+    _write_f05_report(artifact_directory, "boundary", boundary_trials, classification)
+    return F05EvaluationResult(
+        control_event=control_event, boundary_event=boundary_event,
+        control_evidence=tuple(control_evidence), boundary_evidence=tuple(boundary_evidence),
+        control_trials=tuple(control_trials), boundary_trials=tuple(boundary_trials),
+        repeated_attempts=repeated_attempts, classification=classification,
+    )
