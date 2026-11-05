@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AegisQA F03 incorrect result fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Incorrect result scenario</h1>
+      <p id="result" aria-live="polite">Clicks: 0</p>
+      <button id="increment" type="button">Increment</button>
+    </main>
+    <script>
+      window.aegisqaActionCount = 0;
+      document.getElementById("increment").addEventListener("click", function () {
+        window.aegisqaActionCount += 1;
+        // Deliberate controlled defect: the visible result remains Clicks: 0.
+      });
+    </script>
+  </body>
+</html>

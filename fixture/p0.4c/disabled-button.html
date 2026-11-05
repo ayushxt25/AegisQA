@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AegisQA F02 disabled button fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Disabled button scenario</h1>
+      <p id="result" aria-live="polite">Clicks: 0</p>
+      <button id="increment" type="button" disabled>Increment</button>
+    </main>
+    <script>
+      window.aegisqaDisabledClickCount = 0;
+      document.getElementById("increment").addEventListener("click", function () {
+        window.aegisqaDisabledClickCount += 1;
+        document.getElementById("result").textContent = "Clicks: 1";
+      });
+    </script>
+  </body>
+</html>

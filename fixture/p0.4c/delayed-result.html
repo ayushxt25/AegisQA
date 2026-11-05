@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AegisQA F05 delayed result fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Delayed result scenario</h1>
+      <p id="result" aria-live="polite">Clicks: 0</p>
+      <button id="increment" type="button" data-profile="control" data-delay-ms="0">Increment</button>
+    </main>
+    <script>
+      (function () {
+        "use strict";
+
+        var button = document.getElementById("increment");
+        var result = document.getElementById("result");
+        var MAX_BOUNDARY_DELAY_MS = 1000;
+
+        window.aegisqaConfigureRenderingDelay = function (profile, delayMs) {
+          if (!Number.isInteger(delayMs)) {
+            throw new Error("delayMs must be an integer");
+          }
+          if (profile === "control" && delayMs === 0) {
+            button.dataset.profile = profile;
+            button.dataset.delayMs = "0";
+            return;
+          }
+          if (profile === "boundary" && delayMs >= 1 && delayMs <= MAX_BOUNDARY_DELAY_MS) {
+            button.dataset.profile = profile;
+            button.dataset.delayMs = String(delayMs);
+            return;
+          }
+          throw new Error("unsupported deterministic delay profile");
+        };
+
+        button.addEventListener("click", function () {
+          var delayMs = Number(button.dataset.delayMs);
+          button.disabled = true;
+          window.setTimeout(function () {
+            result.textContent = "Clicks: 1";
+            button.disabled = false;
+          }, delayMs);
+        });
+      }());
+    </script>
+  </body>
+</html>
