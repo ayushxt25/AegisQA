@@ -119,6 +119,23 @@ class F05EvaluationResult:
         }
 
 
+@dataclass(frozen=True)
+class F06EvaluationResult:
+    failure_event: FailureEvent
+    evidence: Tuple[EvidenceRecord, ...]
+    missing_assertion_evidence_id: str
+    artifact_directory: Path
+    classification: ClassificationResult
+
+    def to_dict(self) -> dict:
+        return {
+            "classification": {"applied_rule_id": self.classification.applied_rule_id,
+                               "finding": self.classification.finding.to_dict()},
+            "missing_assertion_evidence_id": self.missing_assertion_evidence_id,
+            "run_id": self.failure_event.run_id,
+        }
+
+
 class _ServiceUnavailableHandler(BaseHTTPRequestHandler):
     """Local deterministic endpoint; no request/response data is persisted."""
 
@@ -579,4 +596,93 @@ def collect_f05_repeated_trials(
         control_evidence=tuple(control_evidence), boundary_evidence=tuple(boundary_evidence),
         control_trials=tuple(control_trials), boundary_trials=tuple(boundary_trials),
         repeated_attempts=repeated_attempts, classification=classification,
+    )
+
+
+def collect_f06_ambiguous_evidence(
+    manifest: ExecutionManifest, project_root: Path = PROJECT_ROOT,
+) -> F06EvaluationResult:
+    """Run a real click, then model an unavailable post-action assertion without inventing it."""
+    if manifest.scenario_id is not ScenarioId.F06:
+        raise BrowserCollectionError("F06 ambiguous collection requires an F06 execution manifest.")
+    artifact_directory = _artifact_directory(manifest, project_root)
+    fixture_url = _fixture_url(manifest, project_root)
+    policy = _action_policy(manifest)
+    factory = EvidenceIdFactory(run_id=manifest.run_id)
+    evidence = []
+
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError as error:
+        raise BrowserCollectionError("Playwright is not installed.") from error
+
+    browser = None
+    context = None
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True, timeout=manifest.timeout_ms)
+            context = browser.new_context()
+            context.set_default_timeout(manifest.timeout_ms)
+            context.set_default_navigation_timeout(manifest.timeout_ms)
+            page = context.new_page()
+            page.goto(fixture_url, wait_until="load", timeout=manifest.timeout_ms)
+            observation = PlaywrightBrowserTool(page, policy).observe()
+            evidence.append(factory.create(EvidenceSource.OBSERVATION, "browser", _safe_observation_facts(observation)))
+            action = BrowserAction(ActionKind.CLICK, "#increment")
+            try:
+                validate_action(action, policy)
+                validate_runtime_action(action, policy, observation)
+            except ActionValidationError:
+                evidence.append(factory.create(EvidenceSource.ACTION, "runner", {
+                    "action_kind": action.kind.value, "error": "validation_rejected", "selector": action.target,
+                }))
+            else:
+                try:
+                    page.locator(action.target).click(timeout=manifest.timeout_ms)
+                except PlaywrightError:
+                    evidence.append(factory.create(EvidenceSource.ACTION, "runner", {
+                        "action_kind": action.kind.value, "error": "execution_failed", "selector": action.target,
+                    }))
+                else:
+                    evidence.append(factory.create(EvidenceSource.ACTION, "runner", {
+                        "action_kind": action.kind.value, "outcome": "executed", "selector": action.target,
+                    }))
+            # The browser context ends before a post-action assertion can be observed or persisted.
+            context.close()
+            context = None
+    except PlaywrightError as error:
+        raise BrowserCollectionError("Playwright browser collection failed.") from error
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    missing_assertion_evidence_id = "ev_{0}_{1:06d}".format(manifest.run_id, len(evidence) + 1)
+    event = FailureEvent(
+        failure_id="failure_f06", run_id=manifest.run_id, occurred_at=evidence[-1].captured_at,
+        stage=FailureStage.ASSERTION, observed_facts={"status": "failed"},
+        evidence_ids=tuple(record.evidence_id for record in evidence) + (missing_assertion_evidence_id,),
+    )
+    classification = DeterministicClassifier().classify(event, tuple(evidence))
+    _write_artifacts(artifact_directory, evidence, event)
+    (artifact_directory / "f06-results.json").write_text(
+        canonical_json({
+            "classification": {"applied_rule_id": classification.applied_rule_id,
+                               "finding": classification.finding.to_dict()},
+            "missing_assertion_evidence_id": missing_assertion_evidence_id,
+        }),
+        encoding="utf-8",
+    )
+    return F06EvaluationResult(
+        failure_event=event, evidence=tuple(evidence),
+        missing_assertion_evidence_id=missing_assertion_evidence_id,
+        artifact_directory=artifact_directory, classification=classification,
     )

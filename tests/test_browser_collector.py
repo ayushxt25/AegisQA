@@ -3,6 +3,7 @@
 from http.client import HTTPConnection
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -15,18 +16,62 @@ else:
 from failure_intelligence.browser_collector import (
     ARTIFACT_ROOT,
     BrowserCollectionError,
+    F05EvaluationResult,
+    F05TrialMeasurement,
+    F06EvaluationResult,
     PROJECT_ROOT,
     Loopback503Server,
     collect_browser_evidence,
     collect_f05_repeated_trials,
+    collect_f06_ambiguous_evidence,
 )
 from failure_intelligence.classifier import DeterministicClassifier
-from failure_intelligence.contracts import ConfidenceLevel, EvidenceSource, FailureCategory, FailureStage
+from failure_intelligence.contracts import (
+    ConfidenceLevel,
+    EvidenceRecord,
+    EvidenceSource,
+    FailureCategory,
+    FailureEvent,
+    FailureStage,
+)
 from failure_intelligence.manifests import ExecutionManifest, F05RepeatPlan, ManifestActionPolicy, ScenarioId
 
 
 def attempts(prefix):
     return tuple("{0}_{1:02d}".format(prefix, number) for number in range(1, 11))
+
+
+class CollectorResultSerializationTest(unittest.TestCase):
+    """Result dataclasses must retain independent, callable serializers."""
+
+    def test_f05_and_f06_results_have_their_own_to_dict_methods(self):
+        captured_at = datetime(2026, 11, 6, tzinfo=timezone.utc)
+        record = EvidenceRecord(
+            evidence_id="ev_result_000001", run_id="run_result", source=EvidenceSource.ACTION,
+            producing_component="runner", captured_at=captured_at,
+            observed_facts={"outcome": "executed"},
+        ).finalized()
+        event = FailureEvent(
+            failure_id="failure_result", run_id="run_result", occurred_at=captured_at,
+            stage=FailureStage.ASSERTION, observed_facts={"status": "assertion_failed"},
+            evidence_ids=(record.evidence_id,),
+        )
+        classification = DeterministicClassifier().classify(event, (record,))
+        trial = F05TrialMeasurement("attempt_01", 25, 1, 100, False, record.evidence_id)
+        f05 = F05EvaluationResult(
+            event, event, (record,), (record,), (trial,), (trial,), (), classification,
+        )
+        f06 = F06EvaluationResult(
+            event, (record,), "ev_result_000002", Path("artifacts/p0.4c/run_result"), classification,
+        )
+
+        f05_payload = f05.to_dict()
+        f06_payload = f06.to_dict()
+
+        self.assertEqual(f05_payload["control"]["metrics"]["attempts"], 1)
+        self.assertEqual(f05_payload["boundary"]["trials"][0]["attempt_id"], "attempt_01")
+        self.assertEqual(f06_payload["missing_assertion_evidence_id"], "ev_result_000002")
+        self.assertEqual(f06_payload["run_id"], "run_result")
 
 
 class Loopback503ServerTest(unittest.TestCase):
@@ -189,6 +234,24 @@ class BrowserCollectorTest(unittest.TestCase):
                 )
                 self.assertTrue((Path(boundary_directory) / "f05-results.json").is_file())
                 self.assertTrue((Path(control_directory) / "f05-results.json").is_file())
+
+    def test_f06_real_execution_with_unavailable_post_action_assertion_is_insufficient(self):
+        ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="f06-", dir=str(ARTIFACT_ROOT)) as temporary_directory:
+            run_id = Path(temporary_directory).name
+            result = collect_f06_ambiguous_evidence(
+                self.manifest(ScenarioId.F06, "fixture/index.html", run_id), PROJECT_ROOT
+            )
+            self.assertEqual((result.classification.applied_rule_id, result.classification.finding.classification),
+                             ("R01", FailureCategory.INSUFFICIENT_EVIDENCE))
+            self.assertEqual(result.failure_event.evidence_ids[-1], result.missing_assertion_evidence_id)
+            self.assertNotIn(result.missing_assertion_evidence_id,
+                             {record.evidence_id for record in result.evidence})
+            self.assertTrue(result.missing_assertion_evidence_id.startswith("ev_{0}_".format(run_id)))
+            self.assertEqual({record.run_id for record in result.evidence}, {run_id})
+            serialized = (result.artifact_directory / "f06-results.json").read_text(encoding="utf-8")
+            self.assertNotIn("Clicks: 1", serialized)
+            self.assertNotIn("AegisQA browser runtime fixture", serialized)
 
 
 if __name__ == "__main__":
