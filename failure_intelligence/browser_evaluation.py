@@ -8,10 +8,11 @@ available scenario has been classified.
 from __future__ import annotations
 
 import argparse
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from .browser_collector import (
     PROJECT_ROOT,
@@ -42,6 +43,7 @@ from .manifests import (
 REPORT_SCHEMA_VERSION = "1.0.0"
 REPORT_FILENAME = "browser-evaluation-report.json"
 _ARTIFACT_ROOT = Path("artifacts") / "p0.4c"
+_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _FIXTURES: Mapping[ScenarioId, str] = {
     ScenarioId.F01: "fixture/index.html",
     ScenarioId.F02: "fixture/p0.4c/disabled-button.html",
@@ -72,7 +74,7 @@ class ScenarioEvaluation:
             "scenario_id": self.scenario_id.value,
             "status": self.status,
         }
-        if self.classification is not None:
+        if isinstance(self.classification, ClassificationResult):
             payload["classification"] = {
                 "applied_rule_id": self.classification.applied_rule_id,
                 "finding": self.classification.finding.to_dict(),
@@ -91,6 +93,13 @@ def _run_id(prefix: str) -> str:
     return "{0}_{1}".format(prefix, uuid.uuid4().hex)
 
 
+def _validate_evaluation_run_id(value: str) -> str:
+    """Accept one safe path component only; generated IDs also use this form."""
+    if not isinstance(value, str) or not _SAFE_RUN_ID.fullmatch(value):
+        raise ValueError("evaluation_run_id must be a non-empty safe identifier without path components.")
+    return value
+
+
 def _attempt_ids(prefix: str) -> Tuple[str, ...]:
     return tuple("{0}_{1:02d}".format(prefix, number) for number in range(1, 11))
 
@@ -103,6 +112,7 @@ def build_execution_manifests(
     evaluation_run_id: str, project_root: Path = PROJECT_ROOT, timeout_ms: int = 1_000,
 ) -> Dict[ScenarioId, ExecutionManifest]:
     """Create isolated execution-only manifests for every controlled scenario."""
+    evaluation_run_id = _validate_evaluation_run_id(evaluation_run_id)
     manifests: Dict[ScenarioId, ExecutionManifest] = {}
     for scenario_id, fixture_path in _FIXTURES.items():
         if scenario_id is ScenarioId.F05:
@@ -158,6 +168,7 @@ def build_execution_manifests(
 
 def build_evaluation_manifest(evaluation_run_id: str) -> EvaluationManifest:
     """Return the answer key for the reporting stage only, never for execution."""
+    evaluation_run_id = _validate_evaluation_run_id(evaluation_run_id)
     expectations = (
         EvaluationExpectation(ScenarioId.F01, FailureCategory.AUTOMATION_FAILURE, ConfidenceLevel.VERIFIED),
         EvaluationExpectation(ScenarioId.F02, FailureCategory.AUTOMATION_FAILURE, ConfidenceLevel.VERIFIED),
@@ -239,7 +250,10 @@ class BrowserEvaluationRunner:
 
     def run(self, evaluation_run_id: Optional[str] = None) -> dict:
         """Execute F01-F06 and write the evaluation-only report under artifacts/p0.4c/."""
-        active_run_id = evaluation_run_id or _run_id("evaluation")
+        active_run_id = _validate_evaluation_run_id(evaluation_run_id or _run_id("evaluation"))
+        evaluation_directory = self.project_root / _ARTIFACT_ROOT / active_run_id
+        if (evaluation_directory / REPORT_FILENAME).exists() or (evaluation_directory / "evaluation-manifest.json").exists():
+            raise FileExistsError("Evaluation report or ground-truth manifest already exists for this run ID.")
         manifests = build_execution_manifests(active_run_id, self.project_root)
         outcomes = tuple(self._collect(manifests[scenario_id]) for scenario_id in ScenarioId)
         # Deliberately constructed only after all classifier calls above have completed.
@@ -256,7 +270,14 @@ def evaluate_outcomes(
     answer_key: EvaluationManifest,
 ) -> dict:
     """Join classifier outputs to answer-key data only after collection/classification."""
-    by_scenario = {outcome.scenario_id: outcome for outcome in outcomes}
+    _validate_evaluation_run_id(evaluation_run_id)
+    by_scenario = {}
+    for outcome in outcomes:
+        if not isinstance(outcome, ScenarioEvaluation) or not isinstance(outcome.scenario_id, ScenarioId):
+            raise ValueError("Evaluation outcomes must use known ScenarioId values.")
+        if outcome.scenario_id in by_scenario:
+            raise ValueError("Evaluation outcomes must not contain duplicate scenario IDs.")
+        by_scenario[outcome.scenario_id] = outcome
     expected = {item.scenario_id: item for item in answer_key.expectations}
     results = []
     category_matches = confidence_matches = false_application_defects = 0
@@ -267,7 +288,12 @@ def evaluate_outcomes(
         expectation = expected[scenario_id]
         category_match = confidence_match = False
         actual_category = actual_confidence = applied_rule_id = None
-        if outcome is not None and outcome.classification is not None:
+        valid_completed_classification = (
+            outcome is not None
+            and outcome.status == "completed"
+            and isinstance(outcome.classification, ClassificationResult)
+        )
+        if valid_completed_classification:
             finding = outcome.classification.finding
             actual_category = finding.classification.value
             actual_confidence = finding.confidence.value
@@ -293,21 +319,27 @@ def evaluate_outcomes(
             "applied_rule_id": applied_rule_id,
             "category_match": category_match,
             "confidence_match": confidence_match,
+            "valid_completed_classification": valid_completed_classification,
             "expected_category": expectation.expected_category.value,
             "expected_confidence": expectation.expected_confidence.value,
         })
         results.append(result)
 
     total = len(ScenarioId)
-    completed = sum(item.status == "completed" for item in outcomes)
+    completed = sum(
+        item.status == "completed" and isinstance(item.classification, ClassificationResult)
+        for item in outcomes
+    )
     return {
         "evaluation_run_id": evaluation_run_id,
         "evaluation_schema_version": REPORT_SCHEMA_VERSION,
         "ground_truth_manifest": answer_key.to_dict(),
         "metrics": {
             "classification_accuracy": category_matches / total,
+            "classification_accuracy_denominator": total,
             "completed_scenario_count": completed,
             "confidence_level_agreement": confidence_matches / total,
+            "confidence_level_agreement_denominator": total,
             "false_application_defect_count": false_application_defects,
             "incomplete_scenario_count": total - completed,
             "insufficient_evidence_handling": {
@@ -324,14 +356,15 @@ def evaluate_outcomes(
 def write_evaluation_report(report: Mapping[str, object], project_root: Path = PROJECT_ROOT) -> Path:
     """Write only below the ignored P0.4C artifact root."""
     run_id = report.get("evaluation_run_id")
-    if not isinstance(run_id, str) or not run_id or "/" in run_id or "\\" in run_id:
-        raise ValueError("evaluation_run_id must be a safe non-empty identifier.")
+    _validate_evaluation_run_id(run_id)
     root = (Path(project_root).resolve() / _ARTIFACT_ROOT).resolve()
     destination = (root / run_id / REPORT_FILENAME).resolve()
     try:
         destination.relative_to(root)
     except ValueError as error:
         raise ValueError("Evaluation report must remain under artifacts/p0.4c/.") from error
+    if destination.exists():
+        raise FileExistsError("Evaluation report already exists for this run ID.")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(canonical_json(dict(report)), encoding="utf-8")
     return destination
@@ -345,6 +378,8 @@ def write_evaluation_manifest(manifest: EvaluationManifest, project_root: Path =
         destination.relative_to(root)
     except ValueError as error:
         raise ValueError("Evaluation manifest must remain under artifacts/p0.4c/.") from error
+    if destination.exists():
+        raise FileExistsError("Evaluation ground-truth manifest already exists for this run ID.")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(manifest.normalized_json(), encoding="utf-8")
     return destination

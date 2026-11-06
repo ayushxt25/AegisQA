@@ -167,6 +167,16 @@ Get-Content artifacts/p0.4c/evaluation.json
 
 ## Unresolved risks and limitations
 
+## P0.4C.8 controlled local evaluation record
+
+P0.4C.8 was verified in the user's Windows environment with local Playwright Chromium: all 75 tests passed with zero skips, and all six real browser scenarios completed. The evaluation measured 6/6 expected category matches, 6/6 confidence-level matches, zero false `APPLICATION_DEFECT` classifications, and the expected F05 profile: control 10 passed / 0 failed and boundary 5 passed / 5 failed.
+
+These are verified controlled local browser-experiment results for the evaluation wiring and deterministic classifier contract. They do not establish general real-world reliability, production flakiness, or autonomous diagnosis capability.
+
+This Codex environment is distinct from the user's Windows/Chromium environment. Here, Playwright/Chromium is unavailable, browser-dependent tests are skipped, and the local CLI correctly records incomplete scenarios rather than substituting Codex-environment results for the verified Windows run.
+
+P0.4C.9 further hardens the evaluator: it rejects duplicate or unknown scenario outcomes and unsafe evaluation run IDs, considers a scenario complete only when it has a valid classification, keeps accuracy/confidence denominators fixed at all six scenarios, and refuses to overwrite an existing evaluation report or answer-key manifest.
+
 - Current contract fields omit raw assertion result/page text and accessible names by design. The collector must prove it can derive all required rule facts without a contract extension; any extension needs separate review.
 - `TrustedAssertionContract` and `TrustedInfrastructureContext` remain trusted by caller convention, not authenticated provenance.
 - The F05 boundary profile proves a deliberately injected mixed outcome pattern, not a production flake or general browser nondeterminism.
