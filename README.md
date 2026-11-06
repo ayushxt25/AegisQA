@@ -11,9 +11,11 @@ AegisQA Phase 0 is a set of small, local Python/Playwright experiments for an ev
 - Deterministic evidence-based failure classification with conservative `INSUFFICIENT_EVIDENCE` behavior when evidence is missing, invalid, contradictory, or untrusted.
 - Controlled F01–F06 browser evaluation for missing/disabled targets, incorrect results, local HTTP 503, declared delay profiles, and ambiguous evidence. The verified Windows/Chromium result is documented as a controlled local experiment, not a real-world reliability claim.
 
-## Not implemented: planned Phase 1 infrastructure
+## Phase 1 backend foundation
 
-There is currently no FastAPI backend, PostgreSQL database, project authentication/authorization, durable job queue, browser-worker sandbox, remote-target egress enforcement, Docker Compose configuration, frontend, or production artifact store. The optional Gemini experiment is not an MVP product dependency.
+P1.1 implements a small FastAPI foundation under `backend/`: an application factory, explicit lifespan, typed environment configuration, structured request logs, safe JSON error responses, and liveness/readiness endpoints. It does **not** initialize or claim database, worker, or browser readiness.
+
+There is still no PostgreSQL database, project authentication/authorization, durable job queue, browser-worker sandbox, remote-target egress enforcement, Docker Compose configuration, frontend, public execution endpoint, or production artifact store. The optional Gemini experiment is not an MVP product dependency.
 
 Read the design records before treating these experiments as a product architecture:
 
@@ -45,6 +47,23 @@ Generated artifacts are ignored under `artifacts\`:
 
 - `fixture-result.png`
 - `trace.zip` — inspect with `python -m playwright show-trace artifacts\trace.zip`
+
+## Run the P1.1 backend foundation (PowerShell)
+
+After the shared setup above:
+
+```powershell
+python -m uvicorn backend.app:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+In a second PowerShell window:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health/live
+Invoke-RestMethod http://127.0.0.1:8000/health/ready
+```
+
+The process emits structured JSON logs and accepts only the following P1.1 configuration variables: `AEGISQA_ENVIRONMENT` (`development`, `test`, or `production`), `AEGISQA_DEBUG` (`true` or `false`), `AEGISQA_LOG_LEVEL`, `AEGISQA_SERVICE_NAME`, and `AEGISQA_TRUSTED_HOSTS`. `AEGISQA_DEBUG=true` is rejected in production, and wildcard trusted hosts are rejected. Do not place credentials or target URLs in these variables; the foundation has no database or worker configuration yet.
 
 ## Bounded agent experiment
 

@@ -2,3 +2,9 @@
 playwright==1.48.0
 # Current Google Gen AI SDK releases require Python 3.9+; mock mode remains Python 3.8-compatible.
 google-genai>=1.33.0,<3.0.0; python_version >= "3.9"
+# P1.1 backend foundation. These pins retain Python 3.8 compatibility.
+fastapi==0.115.12
+pydantic==2.10.6
+uvicorn==0.33.0
+# Required by FastAPI/Starlette TestClient for the backend unit tests.
+httpx==0.28.1
