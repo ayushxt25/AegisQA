@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from backend.config import BackendSettings, load_settings
+from backend.database import DatabaseManager
 from backend.errors import register_exception_handlers
 from backend.logging import configure_logging
 from backend.routers.health import router as health_router
@@ -27,6 +28,7 @@ class RuntimeState:
     initialized: bool = False
     initialization_error: Optional[str] = None
     shutdown_complete: bool = False
+    database_configured: bool = False
 
 
 def create_app(
@@ -42,13 +44,16 @@ def create_app(
         stream=log_stream,
         logger_name="aegisqa.api.{0}".format(uuid.uuid4().hex),
     )
-    runtime = RuntimeState()
+    database = DatabaseManager(resolved_settings)
+    runtime = RuntimeState(database_configured=database.configured)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
             if initializer is not None:
                 initializer()
+            if database.configured:
+                database.start()
             runtime.initialized = True
             logger.info(
                 "application_started",
@@ -70,6 +75,7 @@ def create_app(
         try:
             yield
         finally:
+            database.dispose()
             runtime.shutdown_complete = True
             logger.info("application_stopped", extra={"event": "application_stopped"})
 
@@ -81,6 +87,7 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.runtime = runtime
+    app.state.database = database
     app.state.logger = logger
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(resolved_settings.trusted_hosts))
     register_exception_handlers(app, logger)

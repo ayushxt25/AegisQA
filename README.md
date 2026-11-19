@@ -13,9 +13,9 @@ AegisQA Phase 0 is a set of small, local Python/Playwright experiments for an ev
 
 ## Phase 1 backend foundation
 
-P1.1 implements a small FastAPI foundation under `backend/`: an application factory, explicit lifespan, typed environment configuration, structured request logs, safe JSON error responses, and liveness/readiness endpoints. It does **not** initialize or claim database, worker, or browser readiness.
+P1.2 extends the FastAPI foundation under `backend/` with a synchronous SQLAlchemy/PostgreSQL engine manager, short-lived transaction-scoped sessions, and Alembic migrations for users, projects, and project memberships. It does **not** implement authentication, project APIs, execution jobs, queues, workers, or browser execution.
 
-There is still no PostgreSQL database, project authentication/authorization, durable job queue, browser-worker sandbox, remote-target egress enforcement, Docker Compose configuration, frontend, public execution endpoint, or production artifact store. The optional Gemini experiment is not an MVP product dependency.
+There is still no authentication/authorization, durable job queue, browser-worker sandbox, remote-target egress enforcement, Docker Compose configuration, frontend, public execution endpoint, or production artifact store. The optional Gemini experiment is not an MVP product dependency.
 
 Read the design records before treating these experiments as a product architecture:
 
@@ -48,7 +48,7 @@ Generated artifacts are ignored under `artifacts\`:
 - `fixture-result.png`
 - `trace.zip` — inspect with `python -m playwright show-trace artifacts\trace.zip`
 
-## Run the P1.1 backend foundation (PowerShell)
+## Run the P1.2 backend foundation (PowerShell)
 
 After the shared setup above:
 
@@ -63,7 +63,30 @@ Invoke-RestMethod http://127.0.0.1:8000/health/live
 Invoke-RestMethod http://127.0.0.1:8000/health/ready
 ```
 
-The process emits structured JSON logs and accepts only the following P1.1 configuration variables: `AEGISQA_ENVIRONMENT` (`development`, `test`, or `production`), `AEGISQA_DEBUG` (`true` or `false`), `AEGISQA_LOG_LEVEL`, `AEGISQA_SERVICE_NAME`, and `AEGISQA_TRUSTED_HOSTS`. `AEGISQA_DEBUG=true` is rejected in production, and wildcard trusted hosts are rejected. Do not place credentials or target URLs in these variables; the foundation has no database or worker configuration yet.
+The process emits structured JSON logs and accepts validated P1.2 configuration variables. Core settings are `AEGISQA_ENVIRONMENT` (`development`, `test`, or `production`), `AEGISQA_DEBUG` (`true` or `false`), `AEGISQA_LOG_LEVEL`, `AEGISQA_SERVICE_NAME`, and `AEGISQA_TRUSTED_HOSTS`. `AEGISQA_DEBUG=true` is rejected in production, and wildcard trusted hosts are rejected. Database configuration is documented below; never place database URLs or other secrets in logs, source control, or test output.
+
+## Local PostgreSQL and migrations (P1.2)
+
+P1.2 uses PostgreSQL only; it does not use SQLite as a substitute for schema or migration checks. Create a local database and provide its URL explicitly. Development has no implicit database URL, and production rejects startup without one.
+
+```powershell
+$env:AEGISQA_DATABASE_URL = "postgresql+psycopg://aegisqa:replace-with-local-password@127.0.0.1:5432/aegisqa"
+python -m alembic upgrade head
+python -m uvicorn backend.app:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Database pool defaults are deliberately small and can be set through `AEGISQA_DATABASE_POOL_SIZE`, `AEGISQA_DATABASE_MAX_OVERFLOW`, `AEGISQA_DATABASE_POOL_TIMEOUT_SECONDS`, and `AEGISQA_DATABASE_CONNECT_TIMEOUT_SECONDS`. Database URLs are never logged. `/health/live` remains process-only; `/health/ready` returns `503` if an explicitly configured database is unavailable.
+
+For destructive, PostgreSQL-only integration verification, provision a new, empty disposable database separate from development. The suite is opt-in, verifies the live server/database identity for both targets, rejects loopback aliases and default-port variants that identify the same target, and refuses any test database containing user tables or non-system schemas. A name suffix is not evidence of ownership.
+
+```powershell
+$env:AEGISQA_DATABASE_URL = "postgresql+psycopg://aegisqa:replace-with-local-password@127.0.0.1:5432/aegisqa"
+$env:AEGISQA_TEST_DATABASE_URL = "postgresql+psycopg://aegisqa:replace-with-test-password@127.0.0.1:5432/aegisqa_test"
+$env:AEGISQA_RUN_POSTGRES_INTEGRATION_TESTS = "true"
+python -m unittest tests.test_database -v
+```
+
+The test harness creates one random `aegisqa_it_<uuid>` schema per integration-test class, uses that same schema for Alembic and ORM connections, and drops only that schema during cleanup—even after a failed assertion or migration. It never deletes tables from `public`. Normal explicit migrations continue to use `AEGISQA_DATABASE_URL` and do not require the opt-in flag.
 
 ## Bounded agent experiment
 

@@ -8,3 +8,7 @@ pydantic==2.10.6
 uvicorn==0.33.0
 # Required by FastAPI/Starlette TestClient for the backend unit tests.
 httpx==0.28.1
+# P1.2 synchronous PostgreSQL persistence and migration foundation.
+SQLAlchemy==2.0.36
+alembic==1.14.1
+psycopg[binary]==3.2.3
