@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from typing import Mapping, Optional, Tuple
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 from sqlalchemy.engine import make_url
@@ -36,6 +37,16 @@ class BackendSettings(BaseModel):
     database_max_overflow: int = 2
     database_pool_timeout_seconds: int = 10
     database_connect_timeout_seconds: int = 3
+    oidc_issuer: Optional[str] = None
+    oidc_audience: Optional[str] = None
+    oidc_jwks_url: Optional[str] = None
+    oidc_jwks_timeout_seconds: int = 3
+    oidc_jwks_cache_seconds: int = 300
+    execution_worker_id: Optional[str] = None
+    execution_worker_poll_seconds: int = 2
+    execution_worker_lease_seconds: int = 30
+    execution_worker_heartbeat_seconds: int = 10
+    execution_worker_recovery_limit: int = 100
 
     @field_validator("environment")
     @classmethod
@@ -97,13 +108,92 @@ class BackendSettings(BaseModel):
             raise ValueError("database limit is outside the permitted range")
         return value
 
+    @field_validator("oidc_issuer", "oidc_jwks_url")
+    @classmethod
+    def validate_oidc_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("OIDC URL is invalid")
+        parsed = urlparse(value.strip())
+        if parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("OIDC URL is invalid")
+        return value.strip()
+
+    @field_validator("oidc_audience")
+    @classmethod
+    def validate_oidc_audience(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not value.strip() or len(value.strip()) > 255:
+            raise ValueError("OIDC audience is invalid")
+        return value.strip()
+
+    @field_validator("oidc_jwks_timeout_seconds", "oidc_jwks_cache_seconds")
+    @classmethod
+    def validate_oidc_limits(cls, value: int) -> int:
+        if value < 1 or value > 3600:
+            raise ValueError("OIDC limit is outside the permitted range")
+        return value
+
+    @field_validator("execution_worker_id")
+    @classmethod
+    def validate_worker_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not _SERVICE_NAME_PATTERN.fullmatch(normalized):
+            raise ValueError("worker ID is invalid")
+        return normalized
+
+    @field_validator("execution_worker_poll_seconds")
+    @classmethod
+    def validate_worker_poll(cls, value: int) -> int:
+        if not 1 <= value <= 60:
+            raise ValueError("worker poll interval is invalid")
+        return value
+
+    @field_validator("execution_worker_lease_seconds")
+    @classmethod
+    def validate_worker_lease(cls, value: int) -> int:
+        if not 5 <= value <= 3600:
+            raise ValueError("worker lease duration is invalid")
+        return value
+
+    @field_validator("execution_worker_heartbeat_seconds")
+    @classmethod
+    def validate_worker_heartbeat(cls, value: int) -> int:
+        if not 1 <= value <= 1800:
+            raise ValueError("worker heartbeat interval is invalid")
+        return value
+
+    @field_validator("execution_worker_recovery_limit")
+    @classmethod
+    def validate_worker_recovery_limit(cls, value: int) -> int:
+        if not 1 <= value <= 1000:
+            raise ValueError("worker recovery limit is invalid")
+        return value
+
     @model_validator(mode="after")
     def reject_production_debug(self) -> "BackendSettings":
         if self.environment == "production" and self.debug:
             raise ValueError("debug cannot be enabled in production")
         if self.environment == "production" and self.database_url is None:
             raise ValueError("production requires an explicit database URL")
+        oidc_values = (self.oidc_issuer, self.oidc_audience, self.oidc_jwks_url)
+        if any(oidc_values) and not all(oidc_values):
+            raise ValueError("OIDC configuration must be complete")
+        if self.environment == "production" and not all(oidc_values):
+            raise ValueError("production requires OIDC configuration")
+        if self.environment != "test" and any(value and value.startswith("http://") for value in (self.oidc_issuer, self.oidc_jwks_url)):
+            raise ValueError("OIDC URLs must use HTTPS outside test")
+        if self.execution_worker_heartbeat_seconds >= self.execution_worker_lease_seconds:
+            raise ValueError("worker heartbeat must be shorter than lease duration")
         return self
+
+    @property
+    def oidc_configured(self) -> bool:
+        return self.oidc_issuer is not None
 
 
 def load_settings(environ: Optional[Mapping[str, str]] = None) -> BackendSettings:
@@ -120,6 +210,12 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> BackendSetting
     max_overflow = _parse_integer(values.get("AEGISQA_DATABASE_MAX_OVERFLOW", "2"), "AEGISQA_DATABASE_MAX_OVERFLOW")
     pool_timeout = _parse_integer(values.get("AEGISQA_DATABASE_POOL_TIMEOUT_SECONDS", "10"), "AEGISQA_DATABASE_POOL_TIMEOUT_SECONDS")
     connect_timeout = _parse_integer(values.get("AEGISQA_DATABASE_CONNECT_TIMEOUT_SECONDS", "3"), "AEGISQA_DATABASE_CONNECT_TIMEOUT_SECONDS")
+    jwks_timeout = _parse_integer(values.get("AEGISQA_OIDC_JWKS_TIMEOUT_SECONDS", "3"), "AEGISQA_OIDC_JWKS_TIMEOUT_SECONDS")
+    jwks_cache = _parse_integer(values.get("AEGISQA_OIDC_JWKS_CACHE_SECONDS", "300"), "AEGISQA_OIDC_JWKS_CACHE_SECONDS")
+    worker_poll = _parse_integer(values.get("AEGISQA_WORKER_POLL_SECONDS", "2"), "AEGISQA_WORKER_POLL_SECONDS")
+    worker_lease = _parse_integer(values.get("AEGISQA_WORKER_LEASE_SECONDS", "30"), "AEGISQA_WORKER_LEASE_SECONDS")
+    worker_heartbeat = _parse_integer(values.get("AEGISQA_WORKER_HEARTBEAT_SECONDS", "10"), "AEGISQA_WORKER_HEARTBEAT_SECONDS")
+    worker_recovery = _parse_integer(values.get("AEGISQA_WORKER_RECOVERY_LIMIT", "100"), "AEGISQA_WORKER_RECOVERY_LIMIT")
 
     try:
         return BackendSettings(
@@ -133,6 +229,16 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> BackendSetting
             database_max_overflow=max_overflow,
             database_pool_timeout_seconds=pool_timeout,
             database_connect_timeout_seconds=connect_timeout,
+            oidc_issuer=values.get("AEGISQA_OIDC_ISSUER"),
+            oidc_audience=values.get("AEGISQA_OIDC_AUDIENCE"),
+            oidc_jwks_url=values.get("AEGISQA_OIDC_JWKS_URL"),
+            oidc_jwks_timeout_seconds=jwks_timeout,
+            oidc_jwks_cache_seconds=jwks_cache,
+            execution_worker_id=values.get("AEGISQA_WORKER_ID"),
+            execution_worker_poll_seconds=worker_poll,
+            execution_worker_lease_seconds=worker_lease,
+            execution_worker_heartbeat_seconds=worker_heartbeat,
+            execution_worker_recovery_limit=worker_recovery,
         )
     except ValidationError as error:
         raise ConfigurationError("Backend configuration is invalid.") from error

@@ -11,6 +11,15 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
+class SafeApiError(Exception):
+    """A pre-sanitized error for expected authentication/authorization paths."""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
 _HTTP_ERRORS: Dict[int, Tuple[str, str]] = {
     404: ("not_found", "Resource not found."),
     405: ("method_not_allowed", "Method not allowed."),
@@ -19,6 +28,13 @@ _HTTP_ERRORS: Dict[int, Tuple[str, str]] = {
 
 def register_exception_handlers(app: FastAPI, logger: logging.Logger) -> None:
     """Register JSON-only handlers that do not echo request input."""
+
+    @app.exception_handler(SafeApiError)
+    async def safe_api_error(request: Request, exc: SafeApiError) -> JSONResponse:
+        response = _error_response(request, exc.status_code, exc.code, exc.message)
+        if exc.status_code == 401:
+            response.headers["WWW-Authenticate"] = "Bearer"
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(

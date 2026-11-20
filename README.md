@@ -77,6 +77,54 @@ python -m uvicorn backend.app:create_app --factory --host 127.0.0.1 --port 8000
 
 Database pool defaults are deliberately small and can be set through `AEGISQA_DATABASE_POOL_SIZE`, `AEGISQA_DATABASE_MAX_OVERFLOW`, `AEGISQA_DATABASE_POOL_TIMEOUT_SECONDS`, and `AEGISQA_DATABASE_CONNECT_TIMEOUT_SECONDS`. Database URLs are never logged. `/health/live` remains process-only; `/health/ready` returns `503` if an explicitly configured database is unavailable.
 
+## OIDC authentication foundation (P1.3-A)
+
+`GET /v1/me` requires a verified RS256 bearer token and a configured PostgreSQL database. Configure all OIDC values together; production requires HTTPS endpoints. Do not log or commit tokens, JWKS responses, or credentials.
+
+```powershell
+$env:AEGISQA_OIDC_ISSUER = "https://issuer.example"
+$env:AEGISQA_OIDC_AUDIENCE = "aegisqa-api"
+$env:AEGISQA_OIDC_JWKS_URL = "https://issuer.example/.well-known/jwks.json"
+$env:AEGISQA_OIDC_JWKS_TIMEOUT_SECONDS = "3"
+$env:AEGISQA_OIDC_JWKS_CACHE_SECONDS = "300"
+```
+
+Health endpoints remain unauthenticated. P1.3-A adds no project, membership, execution, password, refresh-token, or frontend authentication API.
+
+## Project APIs (P1.3-B)
+
+Authenticated callers can create and list projects at `/v1/projects`. Membership management is project-administrator-only. Project, membership, target, and role information is always resolved server-side from the verified OIDC user; clients cannot authorize themselves with request user IDs or roles.
+
+## Durable execution persistence (P1.4-A)
+
+P1.4-A adds PostgreSQL tables and migrations for jobs, one attempt per job, and append-only safe execution events. It does not add execution APIs, workers, browser execution, or automatic retries. Job transitions are `queued → claimed → running → terminal|recovery_required`; attempt transitions are `queued → claimed → starting → running → terminal`. Future worker writes must fence on attempt ID, lease token, active state, and an unexpired database-time lease.
+
+P1.4-B adds authenticated project-scoped submission, status/history, cancellation, and manual-retry APIs. Submit with a non-empty `Idempotency-Key` header and a bounded `1.0.0` orchestration request (`deadline_seconds` is 1–3600). The endpoints are:
+
+- `POST /v1/projects/{project_id}/executions`
+- `GET /v1/projects/{project_id}/executions`
+- `GET /v1/projects/{project_id}/executions/{job_id}`
+- `POST /v1/projects/{project_id}/executions/{job_id}/cancel`
+- `POST /v1/projects/{project_id}/executions/{job_id}/retry`
+
+Administrators and operators may submit, cancel, and retry; reviewers may read project-scoped history. Submission and retry atomically write a queued job, its one queued attempt, and safe lifecycle events. A repeated key with the same request returns the original job; a conflicting request returns `409`. Cancellation is idempotent. This milestone still does not execute jobs: a separate worker milestone is required.
+
+## Durable worker (P1.4-C)
+
+The separate PostgreSQL worker claims queued attempts with `FOR UPDATE SKIP LOCKED`, assigns a random lease token, fences heartbeat/state writes on that unexpired token, and sweeps queued deadline expiry or abandoned leases. Run it independently of the API:
+
+```powershell
+$env:AEGISQA_WORKER_ID = "local-worker"
+$env:AEGISQA_WORKER_POLL_SECONDS = "2"
+$env:AEGISQA_WORKER_LEASE_SECONDS = "30"
+$env:AEGISQA_WORKER_HEARTBEAT_SECONDS = "10"
+python -m backend.worker
+```
+
+P1.4-C has no browser executor. A claimed job is safely finalized as `failed` with the internal `executor_unavailable` outcome; it is never marked successful merely by being claimed. Lease tokens are never returned by the API or written to structured logs.
+
+If queued work remains queued, verify the worker has the same explicit PostgreSQL URL as the API and that its deadline has not passed. A worker that loses its lease cannot write again; the sweeper records `lost` / `recovery_required`, and an operator must use the manual retry API. No automatic retry or browser process exists at this stage.
+
 For destructive, PostgreSQL-only integration verification, provision a new, empty disposable database separate from development. The suite is opt-in, verifies the live server/database identity for both targets, rejects loopback aliases and default-port variants that identify the same target, and refuses any test database containing user tables or non-system schemas. A name suffix is not evidence of ownership.
 
 ```powershell

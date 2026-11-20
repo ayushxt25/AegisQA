@@ -12,10 +12,16 @@ from fastapi import FastAPI, Request, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from backend.config import BackendSettings, load_settings
+from backend.auth import OidcAuthenticator, UserProvisioner
 from backend.database import DatabaseManager
+from backend.projects import ProjectService
+from backend.executions import ExecutionService
 from backend.errors import register_exception_handlers
 from backend.logging import configure_logging
 from backend.routers.health import router as health_router
+from backend.routers.me import router as me_router
+from backend.routers.projects import router as projects_router
+from backend.routers.executions import router as executions_router
 
 
 Initializer = Callable[[], None]
@@ -45,6 +51,7 @@ def create_app(
         logger_name="aegisqa.api.{0}".format(uuid.uuid4().hex),
     )
     database = DatabaseManager(resolved_settings)
+    authenticator = OidcAuthenticator(resolved_settings)
     runtime = RuntimeState(database_configured=database.configured)
 
     @asynccontextmanager
@@ -88,10 +95,17 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.runtime = runtime
     app.state.database = database
+    app.state.authenticator = authenticator
+    app.state.user_provisioner = UserProvisioner(database)
+    app.state.project_service = ProjectService(database)
+    app.state.execution_service = ExecutionService(database)
     app.state.logger = logger
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(resolved_settings.trusted_hosts))
     register_exception_handlers(app, logger)
     app.include_router(health_router)
+    app.include_router(me_router)
+    app.include_router(projects_router)
+    app.include_router(executions_router)
     _register_request_logging(app, logger)
     return app
 
