@@ -25,13 +25,16 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app import create_app
 from backend.auth import AuthenticatedPrincipal, DisabledAccountError, UserProvisioner
+from backend.classification import AttemptClassificationService
 from backend.config import BackendSettings, ConfigurationError, load_settings
 from backend.database import DatabaseManager, redact_database_url
 from backend.errors import SafeApiError
 from backend.executions import ExecutionService, _deadline_expression, _has_constraint
-from backend.models import ExecutionAttempt, ExecutionEvent, ExecutionJob, MembershipRole, Project, ProjectMembership, User
+from backend.models import ExecutionAttempt, ExecutionClassification, ExecutionEvent, ExecutionEvidence, ExecutionJob, MembershipRole, Project, ProjectMembership, User
 from backend.projects import ProjectService
+from backend.targets import TargetContractService, normalize_target, validate_test_contract
 from backend.worker import ClaimedAttempt, ExecutionWorker
+from backend.docker_sandbox import DockerSandbox
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -316,6 +319,13 @@ class DatabaseConfigurationTest(unittest.TestCase):
                 execution_worker_heartbeat_seconds=10,
             )
 
+    def test_target_and_test_contract_validation_reject_unsafe_values(self) -> None:
+        for origin in ("http://example.test", "https://user@example.test", "https://127.0.0.1", "https://*.example.test"):
+            with self.assertRaises(SafeApiError):
+                normalize_target(origin, ["/"])
+        with self.assertRaises(SafeApiError):
+            validate_test_contract("objective", {"allowed_urls": []}, {})
+
     def test_engine_is_lazy_and_session_scope_requires_configuration(self) -> None:
         settings = BackendSettings(
             environment="test",
@@ -513,14 +523,21 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             # These tables exist only in this harness's generated search_path.
             # Delete dependents first; never use CASCADE/TRUNCATE.
             connection.execute(text("DELETE FROM execution_events"))
+            connection.execute(text("DELETE FROM execution_classifications"))
+            connection.execute(text("DELETE FROM execution_evidence"))
             connection.execute(text("DELETE FROM execution_attempts"))
             connection.execute(text("DELETE FROM execution_jobs"))
+            connection.execute(text("DELETE FROM test_definition_versions"))
+            connection.execute(text("DELETE FROM test_definitions"))
+            connection.execute(text("DELETE FROM browser_target_versions"))
+            connection.execute(text("DELETE FROM browser_targets"))
             connection.execute(text("DELETE FROM project_memberships"))
             connection.execute(text("DELETE FROM projects"))
             connection.execute(text("DELETE FROM users"))
         self.provisioner = UserProvisioner(_IsolatedProvisioningDatabase(self.engine))
         self.project_service = ProjectService(_IsolatedProvisioningDatabase(self.engine))
         self.execution_service = ExecutionService(_IsolatedProvisioningDatabase(self.engine))
+        self.target_service = TargetContractService(_IsolatedProvisioningDatabase(self.engine))
         self.worker = ExecutionWorker(_IsolatedProvisioningDatabase(self.engine), "worker-a", 5)
 
     def _user(self, subject: str = "subject") -> User:
@@ -592,6 +609,195 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         self.project_service.revoke(administrator, str(project.id), str(operator.id))
         history = self.project_service.memberships(administrator, str(project.id))
         self.assertEqual(3, len(history))
+
+    def test_approved_target_and_immutable_definition_bind_execution(self) -> None:
+        administrator = self.provisioner.provision(self._principal())
+        operator = self.provisioner.provision(self._principal("oidc:operator"))
+        project = self.project_service.create(administrator, "Contracts", "contracts")
+        self.project_service.grant(administrator, str(project.id), str(operator.id), "operator")
+        target, target_version = self.target_service.create_target(administrator, str(project.id), "fixture", "https://test.example", ["/qa/"])
+        with self.assertRaises(SafeApiError):
+            self.execution_service.submit(operator, str(project.id), "pending", {"schema_version": "1.0.0", "deadline_seconds": 60, "orchestration": {}, "browser_target_version_id": target_version.id, "test_definition_version_id": uuid.uuid4()})
+        self.target_service.approve_target(administrator, str(project.id), str(target_version.id))
+        policy = {"allowed_urls": ["https://test.example/qa/index"], "allowed_click_targets": ["#go"], "allowed_fill_targets": [], "allowed_inspect_targets": []}
+        assertion = {"kind": "text_equals", "selector": "#result", "expected_text": "done"}
+        definition, version = self.target_service.create_definition(operator, str(project.id), "check", "controlled check", policy, assertion)
+        request = {"schema_version": "1.0.0", "deadline_seconds": 60, "orchestration": {}, "browser_target_version_id": target_version.id, "test_definition_version_id": version.id}
+        job, _, _ = self.execution_service.submit(operator, str(project.id), "bound", request)
+        self.assertEqual(target_version.id, job.browser_target_version_id)
+        self.assertEqual(version.id, job.test_definition_version_id)
+        self.target_service.revoke_target(administrator, str(project.id), str(target_version.id))
+        self.assertEqual(1, self.worker.sweep())
+        detail, _, _ = self.execution_service.detail(administrator, str(project.id), str(job.id))
+        self.assertEqual("failed", detail.status)
+
+    def test_worker_claims_approved_bound_target_with_outer_join_lock_scope(self) -> None:
+        administrator = self.provisioner.provision(self._principal())
+        project = self.project_service.create(administrator, "Claim Target", "claim-target")
+        _, target_version = self.target_service.create_target(administrator, str(project.id), "target", "https://test.example", ["/qa/"])
+        self.target_service.approve_target(administrator, str(project.id), str(target_version.id))
+        policy = {"allowed_urls": ["https://test.example/qa/index"], "allowed_click_targets": [], "allowed_fill_targets": [], "allowed_inspect_targets": []}
+        assertion = {"kind": "text_equals", "selector": "#result", "expected_text": "done"}
+        _, version = self.target_service.create_definition(administrator, str(project.id), "definition", "objective", policy, assertion)
+        request = {"schema_version": "1.0.0", "deadline_seconds": 60, "orchestration": {}, "browser_target_version_id": target_version.id, "test_definition_version_id": version.id}
+        job, attempt, _ = self.execution_service.submit(administrator, str(project.id), "target-claim", request)
+        claim = self.worker.claim_next()
+        self.assertEqual(attempt.id, claim.attempt_id)
+        with self.engine.connect() as connection:
+            self.assertEqual("claimed", connection.execute(text("SELECT status FROM execution_jobs WHERE id = :id"), {"id": job.id}).scalar_one())
+
+    def test_fixture_worker_maps_verified_and_failed_assertions(self) -> None:
+        sandbox_image = os.environ.get("AEGISQA_SANDBOX_IMAGE_ID")
+        fixture_image = os.environ.get("AEGISQA_FIXTURE_IMAGE_ID")
+        if not sandbox_image or not fixture_image:
+            self.skipTest("Docker fixture image IDs are required for durable fixture integration")
+        administrator = self.provisioner.provision(self._principal())
+        project = self.project_service.create(administrator, "Fixture Worker", "fixture-worker")
+        _, target_version = self.target_service.create_target(administrator, str(project.id), "fixture", "https://test.example", ["/qa/"])
+        self.target_service.approve_target(administrator, str(project.id), str(target_version.id))
+        policy = {"allowed_urls": ["https://test.example/qa/index"], "allowed_click_targets": [], "allowed_fill_targets": [], "allowed_inspect_targets": []}
+        _, definition = self.target_service.create_definition(administrator, str(project.id), "fixture-definition", "fixture", policy, {"kind": "text_equals", "selector": "#result", "expected_text": "done"})
+        worker = ExecutionWorker(
+            _IsolatedProvisioningDatabase(self.engine), "fixture-worker", 15,
+            fixture_sandbox=DockerSandbox(sandbox_image), fixture_image_id=fixture_image,
+        )
+        def submit(key, scenario):
+            return self.execution_service.submit(administrator, str(project.id), key, {
+                "schema_version": "1.0.0", "deadline_seconds": 30,
+                "orchestration": {"mode": "controlled_fixture", "scenario_id": scenario},
+                "browser_target_version_id": target_version.id, "test_definition_version_id": definition.id,
+            })[0]
+        passed = submit("fixture-pass", "fixture_increment_v1")
+        failed = submit("fixture-fail", "fixture_assertion_failure_v1")
+        self.assertTrue(worker.process_once())
+        self.assertTrue(worker.process_once())
+        passed_detail, passed_attempt, _ = self.execution_service.detail(administrator, str(project.id), str(passed.id))
+        failed_detail, failed_attempt, _ = self.execution_service.detail(administrator, str(project.id), str(failed.id))
+        self.assertEqual(("succeeded", "succeeded", "assertion_verified"), (passed_detail.status, passed_attempt.status, passed_attempt.terminal_outcome))
+        self.assertEqual(("failed", "failed", "fixture_assertion_failed"), (failed_detail.status, failed_attempt.status, failed_attempt.terminal_outcome))
+        evidence = self.execution_service.evidence(administrator, str(project.id), str(passed.id))
+        self.assertEqual(3, len(evidence))
+        self.assertTrue(all(len(record.content_digest) == 64 for record in evidence))
+        self.assertEqual({"observation", "action", "execution_log"}, {record.source for record in evidence})
+        other = self.project_service.create(administrator, "Other Evidence", "other-evidence")
+        with self.assertRaises(SafeApiError) as denied:
+            self.execution_service.evidence(administrator, str(other.id), str(passed.id))
+        self.assertEqual("not_found", denied.exception.code)
+
+    def _running_claim_with_evidence(self):
+        administrator = self.provisioner.provision(self._principal())
+        project = self.project_service.create(administrator, "Evidence", "evidence-" + uuid.uuid4().hex[:8])
+        job, _, _ = self.execution_service.submit(administrator, str(project.id), "evidence-" + uuid.uuid4().hex, {"schema_version": "1.0.0", "deadline_seconds": 60, "orchestration": {}})
+        claim = self.worker.claim_next()
+        self.assertTrue(self.worker.begin(claim))
+        payload = {"outcome": "assertion_passed", "assertion_verified": True, "duration_ms": 1, "observation": {"url": "http://aegisqa-controlled-fixture:8080/browser", "result": "Clicks: 1", "permitted_element_count": 1}}
+        return administrator, project, job, claim, self.worker._evidence(claim, payload)
+
+    def _evidence_count(self, job_id):
+        with self.engine.connect() as connection:
+            return connection.execute(text("SELECT count(*) FROM execution_evidence WHERE execution_job_id = :id"), {"id": job_id}).scalar_one()
+
+    def _classification_count(self, attempt_id):
+        with self.engine.connect() as connection:
+            return connection.execute(text("SELECT count(*) FROM execution_classifications WHERE execution_attempt_id = :id"), {"id": attempt_id}).scalar_one()
+
+    def test_evidence_rejects_malformed_and_rolls_back_terminal_update(self):
+        _, _, job, claim, _ = self._running_claim_with_evidence()
+        with self.assertRaises(RuntimeError):
+            self.worker.finalize_succeeded(claim, (object(),))
+        detail, attempt, _ = self.execution_service.detail(self.provisioner.provision(self._principal()), str(claim.project_id), str(job.id))
+        self.assertEqual(("running", "running"), (detail.status, attempt.status))
+        self.assertEqual(0, self._evidence_count(job.id))
+
+    def test_stale_or_duplicate_finalization_cannot_change_evidence(self):
+        _, _, job, claim, evidence = self._running_claim_with_evidence()
+        stale = ClaimedAttempt(claim.attempt_id, claim.job_id, claim.project_id, "wrong-token")
+        self.assertFalse(self.worker.finalize_succeeded(stale, evidence))
+        self.assertEqual(0, self._evidence_count(job.id))
+        self.assertTrue(self.worker.finalize_succeeded(claim, evidence))
+        first = self._evidence_count(job.id)
+        self.assertFalse(self.worker.finalize_succeeded(claim, evidence))
+        self.assertEqual(first, self._evidence_count(job.id))
+
+    def test_cancellation_or_deadline_blocks_late_success_evidence(self):
+        administrator, project, job, claim, evidence = self._running_claim_with_evidence()
+        self.execution_service.cancel(administrator, str(project.id), str(job.id))
+        with self.assertRaises(RuntimeError):
+            self.worker.finalize_succeeded(claim, evidence)
+        self.assertEqual(0, self._evidence_count(job.id))
+        self.assertTrue(self.worker.finalize_cancelled(claim))
+        _, _, deadline_job, deadline_claim, deadline_evidence = self._running_claim_with_evidence()
+        with self.engine.begin() as connection:
+            connection.execute(text("UPDATE execution_jobs SET deadline_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = :id"), {"id": deadline_job.id})
+        with self.assertRaises(RuntimeError):
+            self.worker.finalize_succeeded(deadline_claim, deadline_evidence)
+        self.assertEqual(0, self._evidence_count(deadline_job.id))
+
+    def test_event_failure_rolls_back_evidence_and_terminal_state(self):
+        administrator, project, job, claim, evidence = self._running_claim_with_evidence()
+        with patch.object(self.worker, "_event_by_claim", side_effect=RuntimeError("controlled event failure")):
+            with self.assertRaises(RuntimeError):
+                self.worker.finalize_succeeded(claim, evidence)
+        detail, attempt, events = self.execution_service.detail(administrator, str(project.id), str(job.id))
+        self.assertEqual(("running", "running"), (detail.status, attempt.status))
+        self.assertEqual(0, self._evidence_count(job.id))
+        self.assertEqual(["execution_submitted", "execution_claimed", "execution_starting", "execution_running"], [event.category for event in events])
+
+    def test_failed_attempt_classification_is_idempotent_and_never_proves_defect_without_contract(self):
+        administrator, project, job, claim, evidence = self._running_claim_with_evidence()
+        self.assertTrue(self.worker.finalize_failed(claim, "fixture_assertion_failed", evidence))
+        service = AttemptClassificationService(_IsolatedProvisioningDatabase(self.engine))
+        first = service.classify_failed_attempt(project.id, job.id, claim.attempt_id)
+        second = service.classify_failed_attempt(project.id, job.id, claim.attempt_id)
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(("insufficient_evidence", "R06"), (first.category, first.applied_rule_id))
+        with self.engine.connect() as connection:
+            count = connection.execute(
+                text("SELECT count(*) FROM execution_classifications WHERE execution_attempt_id = :id"),
+                {"id": claim.attempt_id},
+            ).scalar_one()
+        self.assertEqual(1, count)
+        self.assertIsNotNone(self.execution_service.classification(administrator, str(project.id), str(job.id)))
+
+    def test_tampered_attempt_evidence_fails_closed_to_r01(self):
+        _, _, job, claim, evidence = self._running_claim_with_evidence()
+        # Hold the normal post-commit classification hook so this test can
+        # tamper with persisted data before the only classification attempt.
+        with patch.object(self.worker, "_classify_failed_attempt"):
+            self.assertTrue(self.worker.finalize_failed(claim, "fixture_assertion_failed", evidence))
+        with self.engine.begin() as connection:
+            connection.execute(text("UPDATE execution_evidence SET content_digest = :digest WHERE execution_job_id = :job"), {"digest": "0" * 64, "job": job.id})
+        result = AttemptClassificationService(_IsolatedProvisioningDatabase(self.engine)).classify_failed_attempt(
+            claim.project_id, claim.job_id, claim.attempt_id,
+        )
+        self.assertEqual(("insufficient_evidence", "R01"), (result.category, result.applied_rule_id))
+
+    def test_classification_recovery_fills_crash_gap_without_changing_terminal_data(self):
+        _, _, job, claim, evidence = self._running_claim_with_evidence()
+        with patch.object(self.worker, "_classify_failed_attempt"):
+            self.assertTrue(self.worker.finalize_failed(claim, "fixture_assertion_failed", evidence))
+        self.assertEqual(0, self._classification_count(claim.attempt_id))
+        before_evidence = self._evidence_count(job.id)
+        service = AttemptClassificationService(_IsolatedProvisioningDatabase(self.engine))
+        self.assertEqual(1, service.recover_failed_attempts())
+        self.assertEqual(1, self._classification_count(claim.attempt_id))
+        self.assertEqual(before_evidence, self._evidence_count(job.id))
+        detail, attempt, _ = self.execution_service.detail(self.provisioner.provision(self._principal()), str(claim.project_id), str(job.id))
+        self.assertEqual(("failed", "failed"), (detail.status, attempt.status))
+        self.assertEqual(0, service.recover_failed_attempts())
+
+    def test_concurrent_classification_recovery_is_unique_and_write_failure_is_retryable(self):
+        _, _, job, claim, evidence = self._running_claim_with_evidence()
+        with patch.object(self.worker, "_classify_failed_attempt"):
+            self.assertTrue(self.worker.finalize_failed(claim, "fixture_assertion_failed", evidence))
+        service = AttemptClassificationService(_IsolatedProvisioningDatabase(self.engine))
+        with patch("backend.classification.ExecutionEvent", side_effect=RuntimeError("controlled write failure")):
+            self.assertEqual(0, service.recover_failed_attempts())
+        self.assertEqual(0, self._classification_count(claim.attempt_id))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda _: AttemptClassificationService(_IsolatedProvisioningDatabase(self.engine)).recover_failed_attempts(), range(2)))
+        self.assertEqual(1, self._classification_count(claim.attempt_id))
+        self.assertEqual(3, self._evidence_count(job.id))
 
     def _execution_job(self, project_id, user_id, key="key-1", retry_of=None):
         return ExecutionJob(id=uuid.uuid4(), project_id=project_id, requested_by_user_id=user_id, request_schema_version="1.0.0", request_snapshot={"objective": "controlled"}, idempotency_key=key, request_fingerprint="a" * 64, status="queued", deadline_at=datetime.now(timezone.utc) + timedelta(minutes=5), retry_of_execution_job_id=retry_of)
@@ -919,7 +1125,7 @@ class PostgreSQLMigrationTest(unittest.TestCase):
         target = _prepare_isolated_test_target()
 
         def verify_upgraded(engine) -> None:
-            self.assertTrue({"users", "projects", "project_memberships"}.issubset(inspect(engine).get_table_names()))
+            self.assertTrue({"users", "projects", "project_memberships", "browser_targets", "browser_target_versions", "test_definitions", "test_definition_versions"}.issubset(inspect(engine).get_table_names()))
 
         def verify_downgraded(engine) -> None:
             self.assertFalse({"users", "projects", "project_memberships"}.intersection(inspect(engine).get_table_names()))

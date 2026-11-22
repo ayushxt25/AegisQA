@@ -8,7 +8,8 @@ from sqlalchemy import Integer, bindparam, func, select, text
 from sqlalchemy.exc import IntegrityError
 from backend.database import DatabaseManager
 from backend.errors import SafeApiError
-from backend.models import ExecutionAttempt, ExecutionEvent, ExecutionJob, MembershipRole, ProjectMembership, User
+from backend.models import BrowserTargetVersion, ExecutionAttempt, ExecutionClassification, ExecutionEvent, ExecutionEvidence, ExecutionJob, MembershipRole, ProjectMembership, TestDefinitionVersion, User
+from backend.targets import _url_in_target
 
 _TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "recovery_required"}
 _OPERATORS = {MembershipRole.ADMINISTRATOR.value, MembershipRole.OPERATOR.value}
@@ -20,11 +21,13 @@ class ExecutionService:
         self._database = database
 
     def submit(self, actor: User, project_id: str, key: str, request: dict):
+        request = _normalize_request(request)
         fingerprint = _fingerprint(request)
         try:
             with self._database.session_scope() as session:
                 self._role(session, actor, project_id, require_operator=True)
-                job, attempt = self._new_job(session, actor, project_id, key, fingerprint, request, None)
+                target_id, definition_id = self._binding(session, project_id, request)
+                job, attempt = self._new_job(session, actor, project_id, key, fingerprint, request, None, target_id, definition_id)
                 return job, attempt, False
         except IntegrityError as error:
             if not _has_constraint(error, _IDEMPOTENCY_CONSTRAINT):
@@ -53,6 +56,35 @@ class ExecutionService:
             attempt = session.scalar(select(ExecutionAttempt).where(ExecutionAttempt.project_id == project_id, ExecutionAttempt.execution_job_id == job.id))
             events = list(session.scalars(select(ExecutionEvent).where(ExecutionEvent.project_id == project_id, ExecutionEvent.execution_job_id == job.id).order_by(ExecutionEvent.created_at, ExecutionEvent.id)))
             return job, attempt, events
+
+    def evidence(self, actor: User, project_id: str, job_id: str):
+        with self._database.session_scope() as session:
+            self._role(session, actor, project_id, require_operator=False)
+            job = session.scalar(select(ExecutionJob.id).where(
+                ExecutionJob.project_id == project_id, ExecutionJob.id == job_id,
+            ))
+            if job is None:
+                raise SafeApiError(404, "not_found", "Resource not found.")
+            rows = session.execute(
+                select(ExecutionEvidence).where(
+                    ExecutionEvidence.project_id == project_id,
+                    ExecutionEvidence.execution_job_id == job_id,
+                ).order_by(ExecutionEvidence.captured_at, ExecutionEvidence.id)
+            ).scalars().all()
+            return rows
+
+    def classification(self, actor: User, project_id: str, job_id: str):
+        with self._database.session_scope() as session:
+            self._role(session, actor, project_id, require_operator=False)
+            job = session.scalar(select(ExecutionJob.id).where(
+                ExecutionJob.project_id == project_id, ExecutionJob.id == job_id,
+            ))
+            if job is None:
+                raise SafeApiError(404, "not_found", "Resource not found.")
+            return session.scalar(select(ExecutionClassification).where(
+                ExecutionClassification.project_id == project_id,
+                ExecutionClassification.execution_job_id == job_id,
+            ))
 
     def cancel(self, actor: User, project_id: str, job_id: str):
         with self._database.session_scope() as session:
@@ -85,8 +117,9 @@ class ExecutionService:
                 if parent.status not in _TERMINAL: raise SafeApiError(409, "execution_not_retryable", "Execution is not retryable.")
                 request = parent.request_snapshot
                 fingerprint = _fingerprint(request)
+                target_id, definition_id = self._retry_binding(session, project_id, parent)
                 job, attempt = self._new_job(
-                    session, actor, project_id, key, fingerprint, request, parent.id
+                    session, actor, project_id, key, fingerprint, request, parent.id, target_id, definition_id
                 )
                 self._event(session, project_id, parent.id, None, actor.id, "execution_retry_requested")
                 return job, attempt, False
@@ -106,7 +139,7 @@ class ExecutionService:
                     return self._attempt_for_job(session, project_id, child, replayed=True)
             raise SafeApiError(409, "retry_already_exists", "Retry already exists.") from None
 
-    def _new_job(self, session, actor, project_id, key, fingerprint, request, retry_of):
+    def _new_job(self, session, actor, project_id, key, fingerprint, request, retry_of, target_version_id=None, definition_version_id=None):
         deadline = session.scalar(select(_deadline_expression(request["deadline_seconds"])))
         job = ExecutionJob(
             id=uuid.uuid4(),
@@ -119,6 +152,8 @@ class ExecutionService:
             status="queued",
             deadline_at=deadline,
             retry_of_execution_job_id=retry_of,
+            browser_target_version_id=target_version_id,
+            test_definition_version_id=definition_version_id,
         )
         attempt = ExecutionAttempt(
             id=uuid.uuid4(),
@@ -136,6 +171,27 @@ class ExecutionService:
         self._event(session, project_id, job.id, attempt.id, actor.id, "execution_submitted")
         session.flush()
         return job, attempt
+
+    def _binding(self, session, project_id, request):
+        target_id = request.get("browser_target_version_id")
+        definition_id = request.get("test_definition_version_id")
+        if target_id is None and definition_id is None:
+            # Direct P1.4 service callers remain supported; public API requires both.
+            return None, None
+        if target_id is None or definition_id is None:
+            raise SafeApiError(422, "validation_error", "Request validation failed.")
+        target = session.scalar(select(BrowserTargetVersion).where(BrowserTargetVersion.project_id == project_id, BrowserTargetVersion.id == target_id, BrowserTargetVersion.approval_state == "approved"))
+        definition = session.scalar(select(TestDefinitionVersion).where(TestDefinitionVersion.project_id == project_id, TestDefinitionVersion.id == definition_id))
+        if target is None or definition is None:
+            raise SafeApiError(409, "execution_contract_unavailable", "Execution contract is unavailable.")
+        if not all(_url_in_target(url, target.origin, target.path_prefixes) for url in definition.action_policy.get("allowed_urls", [])):
+            raise SafeApiError(422, "validation_error", "Request validation failed.")
+        return target.id, definition.id
+
+    def _retry_binding(self, session, project_id, parent):
+        if parent.browser_target_version_id is None and parent.test_definition_version_id is None:
+            return None, None
+        return self._binding(session, project_id, {"browser_target_version_id": parent.browser_target_version_id, "test_definition_version_id": parent.test_definition_version_id})
 
     def _idempotent(self, project_id, key, fingerprint):
         with self._database.session_scope() as session:
@@ -197,6 +253,19 @@ def _fingerprint(request):
     return hashlib.sha256(
         json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _normalize_request(request):
+    if not isinstance(request, dict):
+        raise SafeApiError(422, "validation_error", "Request validation failed.")
+    normalized = dict(request)
+    for field in ("browser_target_version_id", "test_definition_version_id"):
+        if isinstance(normalized.get(field), uuid.UUID):
+            normalized[field] = str(normalized[field])
+    try:
+        return json.loads(json.dumps(normalized, sort_keys=True, separators=(",", ":")))
+    except (TypeError, ValueError):
+        raise SafeApiError(422, "validation_error", "Request validation failed.") from None
 
 
 def _deadline_expression(deadline_seconds: int):

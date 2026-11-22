@@ -125,7 +125,83 @@ P1.4-C has no browser executor. A claimed job is safely finalized as `failed` wi
 
 If queued work remains queued, verify the worker has the same explicit PostgreSQL URL as the API and that its deadline has not passed. A worker that loses its lease cannot write again; the sweeper records `lost` / `recovery_required`, and an operator must use the manual retry API. No automatic retry or browser process exists at this stage.
 
+## Approved browser contracts (P1.5-A)
+
+Administrators create pending HTTPS-only target versions at `POST /v1/projects/{project_id}/targets` and explicitly approve/revoke them. Operators create immutable bounded test-definition versions at `/v1/projects/{project_id}/test-definitions`. New public execution submissions must name both `browser_target_version_id` and `test_definition_version_id`; the target must be approved and every allowed navigation must remain inside its approved origin/path prefixes. Revoking a queued bound target deterministically prevents dispatch and the worker finalizes it as `failed`/`target_not_approved`. This is authorization metadata only: browser execution and network isolation remain disabled.
+
+## Child supervisor (P1.5-B)
+
+`backend.supervisor` launches only the fixed `python -m backend.execution_child` entry point with a minimal allowlisted environment and JSON-lines IPC. It enforces startup/runtime/termination deadlines and process-tree termination. The current child is a deterministic no-browser fixture and returns only `executor_unavailable`; it cannot access PostgreSQL or make browser success authoritative.
+
+## Browser containment foundation (P1.5-C1)
+
+Windows supervised children now receive Job Object process-count, job-memory, and hard CPU-rate limits. This is resource containment only. The explicit browser-containment gate remains **closed** on Windows because no enforceable default-deny network or filesystem sandbox exists here; it is also closed on Linux until a rootless container, cgroup, capability, filesystem, and restricted-network deployment is implemented and verified. No browser path may bypass this gate.
+
 For destructive, PostgreSQL-only integration verification, provision a new, empty disposable database separate from development. The suite is opt-in, verifies the live server/database identity for both targets, rejects loopback aliases and default-port variants that identify the same target, and refuses any test database containing user tables or non-system schemas. A name suffix is not evidence of ownership.
+
+## Restricted Docker sandbox (P1.5-C2)
+
+`backend.docker_sandbox` is a separate, fail-closed adapter for a future browser child. It accepts only a locally resolved immutable `sha256:<image-id>` reference, launches only the fixed diagnostic entry point, and uses Docker Linux containers with `--network none`, non-root identity, `no-new-privileges`, all capabilities dropped, a read-only root filesystem, bounded `/tmp`, PID/memory/CPU limits, and Docker's builtin seccomp profile. It never mounts the Docker socket, host directories, or existing containers and never forwards database URLs or lease tokens. It force-removes only generated `aegisqa-sandbox-<id>` containers.
+
+Build and run the explicit local acceptance probe (this creates only the dedicated sandbox image/container):
+
+```powershell
+docker build --pull=false --file sandbox\Dockerfile --tag aegisqa-execution-sandbox:local .
+$env:AEGISQA_SANDBOX_IMAGE_ID = docker image inspect --format '{{.Id}}' aegisqa-execution-sandbox:local
+$env:AEGISQA_RUN_DOCKER_CONTAINMENT_TESTS = "true"
+python -m unittest tests.test_docker_sandbox -v
+```
+
+The probe checks Docker-reported restrictions plus blocked DNS, external TCP/UDP, host loopback, private-address, and metadata-address connectivity. This is not an approval for Chromium: the local Docker daemon is not verified rootless, no fixture-only egress path exists, and real browser execution remains disabled.
+
+### Controlled fixture network (P1.5-C3)
+
+The development-only fixture probe creates two uniquely named, labeled `--internal` bridge networks. The sandbox and one fixed HTTP fixture join the approved network; an identical unapproved fixture is isolated on the second network. Docker inspection rejects any unexpected approved-network member. The child can use only the fixed alias/path and rejects the fixture's deliberate external redirect before following it. Neither fixture identity, network name, alias, nor endpoint comes from an execution request. This separate HTTP-only development authorization does not weaken the production HTTPS target-approval contract.
+
+```powershell
+docker build --pull=false --file sandbox\Dockerfile --tag aegisqa-execution-sandbox:local .
+docker build --pull=false --file sandbox\Fixture.Dockerfile --tag aegisqa-controlled-fixture:local sandbox
+$env:AEGISQA_SANDBOX_IMAGE_ID = docker image inspect --format '{{.Id}}' aegisqa-execution-sandbox:local
+$env:AEGISQA_FIXTURE_IMAGE_ID = docker image inspect --format '{{.Id}}' aegisqa-controlled-fixture:local
+$env:AEGISQA_RUN_DOCKER_CONTAINMENT_TESTS = "true"
+python -m unittest tests.test_docker_sandbox -v
+```
+
+Cleanup removes only containers/networks whose generated names and `com.aegisqa.owner=fixture-boundary` label both match. Docker daemon administrators remain trusted; container networking alone is not a complete defense against a compromised browser and does not itself enable browser execution.
+
+### Controlled Playwright fixture execution (P1.5-C4)
+
+The sandbox image installs Playwright 1.48.0 and its matching Chromium build from the pinned Bookworm base. Its fixed child reuses the Phase 0 `AgentRunner`, `MockPlanner`, `ActionPolicy`, `PlaywrightBrowserTool`, and deterministic assertion path. It accepts only version `1.0` with one of three trusted scenario IDs; it cannot receive URLs, selectors, scripts, credentials, lease tokens, or user commands.
+
+The browser uses the same owned internal fixture network. Docker enforces non-root/no-new-privileges, dropped capabilities, read-only root, seccomp, no host mounts, no published ports, 1 GiB memory, one CPU, 256 PIDs, and 128 MiB bounded `/tmp`/shared memory. Chromium requires that bounded process profile; no Docker control was removed. A child result is accepted only if its bounded versioned schema passes validation; process exit alone is never success.
+
+```powershell
+docker build --pull=false --file sandbox\Dockerfile --tag aegisqa-execution-sandbox:playwright .
+docker build --pull=false --file sandbox\Fixture.Dockerfile --tag aegisqa-controlled-fixture:local sandbox
+$env:AEGISQA_SANDBOX_IMAGE_ID = docker image inspect --format '{{.Id}}' aegisqa-execution-sandbox:playwright
+$env:AEGISQA_FIXTURE_IMAGE_ID = docker image inspect --format '{{.Id}}' aegisqa-controlled-fixture:local
+$env:AEGISQA_RUN_DOCKER_CONTAINMENT_TESTS = "true"
+python -m unittest tests.test_docker_sandbox -v
+```
+
+This is limited to controlled local fixtures. It does not connect P1.4 jobs, permit approved public targets, or enable general browser execution.
+
+## Durable fixture-worker dispatch (P1.5-D1)
+
+The worker can opt in to the same fixture-only Docker runtime. A claimed job must retain approved P1.5-A target/test-version bindings and have exactly this bounded orchestration object: `{"mode":"controlled_fixture","scenario_id":"fixture_increment_v1"}` (or the two fixed failure/timeout scenarios). The target is never used as a browser destination. Legacy, malformed, or arbitrary orchestrations finalize as failed without launching Chromium.
+
+```powershell
+$env:AEGISQA_FIXTURE_EXECUTION_ENABLED = "true"
+$env:AEGISQA_FIXTURE_SANDBOX_IMAGE_ID = docker image inspect --format '{{.Id}}' aegisqa-execution-sandbox:playwright
+$env:AEGISQA_FIXTURE_IMAGE_ID = docker image inspect --format '{{.Id}}' aegisqa-controlled-fixture:local
+python -m backend.worker
+```
+
+This opt-in is rejected in production. The worker retains the lease, heartbeats while monitoring Docker, and maps only a validated `assertion_passed` result to `succeeded`; cancellation/deadline interruption wins over late output. It does not send database URLs, lease tokens, or API credentials to Docker.
+
+## Durable fixture evidence (P1.5-D2)
+
+Migration `20261122_01` adds append-only, attempt-linked sanitized evidence. The parent—not the Docker child—creates finalized Phase 0 `EvidenceRecord` values and SHA-256 digests after validating the bounded result envelope. Success and failed assertions persist observation, action, and assertion records atomically with the fenced terminal transition. Execution detail returns only bounded sanitized evidence summaries to active project members.
 
 ```powershell
 $env:AEGISQA_DATABASE_URL = "postgresql+psycopg://aegisqa:replace-with-local-password@127.0.0.1:5432/aegisqa"
@@ -135,6 +211,12 @@ python -m unittest tests.test_database -v
 ```
 
 The test harness creates one random `aegisqa_it_<uuid>` schema per integration-test class, uses that same schema for Alembic and ORM connections, and drops only that schema during cleanup—even after a failed assertion or migration. It never deletes tables from `public`. Normal explicit migrations continue to use `AEGISQA_DATABASE_URL` and do not require the opt-in flag.
+
+## Deterministic durable failure classification (P1.5-D3)
+
+Migration `20261123_01` adds one immutable, attempt-scoped deterministic classification result. Only committed failed-attempt evidence is reconstructed as digest-verified Phase 0 records. The Phase 0 classifier remains authoritative; missing, malformed, tampered, cross-attempt, or untrusted evidence fails closed to insufficient evidence. Classification is advisory: it never changes execution status, and a failed assertion without an independently trusted assertion contract does not prove an application defect.
+
+The worker's bounded maintenance sweep also recovers failed attempts that have committed evidence but no classification, such as a crash between finalization and the advisory write. Recovery never reruns Chromium or changes the terminal job/attempt/evidence state; the attempt-level unique constraint resolves concurrent recovery safely.
 
 ## Bounded agent experiment
 

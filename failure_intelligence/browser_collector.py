@@ -339,7 +339,10 @@ def collect_browser_evidence(
     context = None
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True, timeout=manifest.timeout_ms)
+            browser = playwright.chromium.launch(
+                headless=True,
+                timeout=max(10000, manifest.timeout_ms)
+            )
             context = browser.new_context()
             context.set_default_timeout(manifest.timeout_ms)
             context.set_default_navigation_timeout(manifest.timeout_ms)

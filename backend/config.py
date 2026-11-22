@@ -16,6 +16,7 @@ _LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
 _DEFAULT_TRUSTED_HOSTS = ("localhost", "127.0.0.1", "testserver")
 _SERVICE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 _HOST_PATTERN = re.compile(r"^[A-Za-z0-9.-]+$")
+_IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class ConfigurationError(ValueError):
@@ -47,6 +48,9 @@ class BackendSettings(BaseModel):
     execution_worker_lease_seconds: int = 30
     execution_worker_heartbeat_seconds: int = 10
     execution_worker_recovery_limit: int = 100
+    fixture_execution_enabled: bool = False
+    fixture_sandbox_image_id: Optional[str] = None
+    fixture_image_id: Optional[str] = None
 
     @field_validator("environment")
     @classmethod
@@ -146,6 +150,15 @@ class BackendSettings(BaseModel):
             raise ValueError("worker ID is invalid")
         return normalized
 
+    @field_validator("fixture_sandbox_image_id", "fixture_image_id")
+    @classmethod
+    def validate_fixture_image_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        if not _IMAGE_ID_PATTERN.fullmatch(value.strip()):
+            raise ValueError("fixture image ID is invalid")
+        return value.strip()
+
     @field_validator("execution_worker_poll_seconds")
     @classmethod
     def validate_worker_poll(cls, value: int) -> int:
@@ -189,6 +202,12 @@ class BackendSettings(BaseModel):
             raise ValueError("OIDC URLs must use HTTPS outside test")
         if self.execution_worker_heartbeat_seconds >= self.execution_worker_lease_seconds:
             raise ValueError("worker heartbeat must be shorter than lease duration")
+        fixture_images = (self.fixture_sandbox_image_id, self.fixture_image_id)
+        if self.fixture_execution_enabled:
+            if self.environment == "production" or not all(fixture_images):
+                raise ValueError("fixture execution is not configured safely")
+        elif any(fixture_images):
+            raise ValueError("fixture images require explicit fixture execution opt-in")
         return self
 
     @property
@@ -216,6 +235,7 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> BackendSetting
     worker_lease = _parse_integer(values.get("AEGISQA_WORKER_LEASE_SECONDS", "30"), "AEGISQA_WORKER_LEASE_SECONDS")
     worker_heartbeat = _parse_integer(values.get("AEGISQA_WORKER_HEARTBEAT_SECONDS", "10"), "AEGISQA_WORKER_HEARTBEAT_SECONDS")
     worker_recovery = _parse_integer(values.get("AEGISQA_WORKER_RECOVERY_LIMIT", "100"), "AEGISQA_WORKER_RECOVERY_LIMIT")
+    fixture_execution = _parse_boolean(values.get("AEGISQA_FIXTURE_EXECUTION_ENABLED", "false"), "AEGISQA_FIXTURE_EXECUTION_ENABLED")
 
     try:
         return BackendSettings(
@@ -239,6 +259,9 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> BackendSetting
             execution_worker_lease_seconds=worker_lease,
             execution_worker_heartbeat_seconds=worker_heartbeat,
             execution_worker_recovery_limit=worker_recovery,
+            fixture_execution_enabled=fixture_execution,
+            fixture_sandbox_image_id=values.get("AEGISQA_FIXTURE_SANDBOX_IMAGE_ID"),
+            fixture_image_id=values.get("AEGISQA_FIXTURE_IMAGE_ID"),
         )
     except ValidationError as error:
         raise ConfigurationError("Backend configuration is invalid.") from error

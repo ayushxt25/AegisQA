@@ -15,6 +15,7 @@ from backend.config import BackendSettings, load_settings
 from backend.auth import OidcAuthenticator, UserProvisioner
 from backend.database import DatabaseManager
 from backend.projects import ProjectService
+from backend.targets import TargetContractService
 from backend.executions import ExecutionService
 from backend.errors import register_exception_handlers
 from backend.logging import configure_logging
@@ -22,6 +23,7 @@ from backend.routers.health import router as health_router
 from backend.routers.me import router as me_router
 from backend.routers.projects import router as projects_router
 from backend.routers.executions import router as executions_router
+from backend.routers.targets import router as targets_router
 
 
 Initializer = Callable[[], None]
@@ -99,6 +101,7 @@ def create_app(
     app.state.user_provisioner = UserProvisioner(database)
     app.state.project_service = ProjectService(database)
     app.state.execution_service = ExecutionService(database)
+    app.state.target_contract_service = TargetContractService(database)
     app.state.logger = logger
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(resolved_settings.trusted_hosts))
     register_exception_handlers(app, logger)
@@ -106,6 +109,7 @@ def create_app(
     app.include_router(me_router)
     app.include_router(projects_router)
     app.include_router(executions_router)
+    app.include_router(targets_router)
     _register_request_logging(app, logger)
     return app
 

@@ -104,6 +104,80 @@ class ProjectMembership(Base):
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class BrowserTarget(Base):
+    __tablename__ = "browser_targets"
+    __table_args__ = (
+        UniqueConstraint("project_id", "id", name="uq_browser_targets_project_id_id"),
+        UniqueConstraint("project_id", "name", name="uq_browser_targets_project_name"),
+        CheckConstraint("status IN ('active', 'archived')", name="ck_browser_targets_status"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+
+
+class BrowserTargetVersion(Base):
+    __tablename__ = "browser_target_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "id", name="uq_browser_target_versions_project_id_id"),
+        UniqueConstraint("browser_target_id", "version", name="uq_browser_target_versions_target_version"),
+        CheckConstraint("approval_state IN ('pending', 'approved', 'revoked')", name="ck_browser_target_versions_approval"),
+        CheckConstraint("jsonb_typeof(path_prefixes) = 'array'", name="ck_browser_target_versions_paths"),
+        ForeignKeyConstraint(["project_id", "browser_target_id"], ["browser_targets.project_id", "browser_targets.id"], ondelete="RESTRICT"),
+        Index("ix_browser_target_versions_dispatch", "project_id", "approval_state"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    browser_target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    origin: Mapped[str] = mapped_column(String(512), nullable=False)
+    path_prefixes: Mapped[list] = mapped_column(JSONB, nullable=False)
+    approval_state: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'pending'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
+
+
+class TestDefinition(Base):
+    __tablename__ = "test_definitions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "id", name="uq_test_definitions_project_id_id"),
+        UniqueConstraint("project_id", "name", name="uq_test_definitions_project_name"),
+        CheckConstraint("status IN ('active', 'archived')", name="ck_test_definitions_status"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+
+
+class TestDefinitionVersion(Base):
+    __tablename__ = "test_definition_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "id", name="uq_test_definition_versions_project_id_id"),
+        UniqueConstraint("test_definition_id", "version", name="uq_test_definition_versions_definition_version"),
+        CheckConstraint("jsonb_typeof(action_policy) = 'object'", name="ck_test_definition_versions_policy"),
+        CheckConstraint("jsonb_typeof(assertion_contract) = 'object'", name="ck_test_definition_versions_assertion"),
+        ForeignKeyConstraint(["project_id", "test_definition_id"], ["test_definitions.project_id", "test_definitions.id"], ondelete="RESTRICT"),
+        Index("ix_test_definition_versions_project_created", "project_id", "created_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    test_definition_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    objective: Mapped[str] = mapped_column(String(1000), nullable=False)
+    action_policy: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    assertion_contract: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+
+
 class ExecutionJob(Base):
     __tablename__ = "execution_jobs"
     __table_args__ = (
@@ -115,6 +189,8 @@ class ExecutionJob(Base):
         CheckConstraint("request_schema_version ~ '^[0-9]+\\.[0-9]+\\.[0-9]+$'", name="ck_execution_jobs_request_schema_version"),
         CheckConstraint("request_snapshot <> '{}'::jsonb", name="ck_execution_jobs_request_nonempty"),
         ForeignKeyConstraint(["project_id", "retry_of_execution_job_id"], ["execution_jobs.project_id", "execution_jobs.id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(["project_id", "browser_target_version_id"], ["browser_target_versions.project_id", "browser_target_versions.id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(["project_id", "test_definition_version_id"], ["test_definition_versions.project_id", "test_definition_versions.id"], ondelete="RESTRICT"),
         Index("ix_execution_jobs_queue", "status", "created_at"),
         Index("ix_execution_jobs_project_created", "project_id", "created_at"),
     )
@@ -131,6 +207,8 @@ class ExecutionJob(Base):
     cancel_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     retry_of_execution_job_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    browser_target_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    test_definition_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
 class ExecutionAttempt(Base):
@@ -176,4 +254,56 @@ class ExecutionEvent(Base):
     event_metadata: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     actor_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
     worker_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class ExecutionEvidence(Base):
+    """Append-only, parent-validated Phase 0 evidence for one durable attempt."""
+    __tablename__ = "execution_evidence"
+    __table_args__ = (
+        UniqueConstraint("execution_attempt_id", "evidence_id", name="uq_execution_evidence_attempt_id"),
+        ForeignKeyConstraint(["project_id", "execution_job_id", "execution_attempt_id"], ["execution_attempts.project_id", "execution_attempts.execution_job_id", "execution_attempts.id"], ondelete="RESTRICT"),
+        CheckConstraint("jsonb_typeof(observed_facts) = 'object' AND octet_length(observed_facts::text) <= 4096", name="ck_execution_evidence_facts"),
+        CheckConstraint("char_length(evidence_id) > 0 AND char_length(content_digest) = 64", name="ck_execution_evidence_identity"),
+        Index("ix_execution_evidence_attempt", "project_id", "execution_attempt_id", "captured_at", "id"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_attempt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    evidence_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'1.0.0'"))
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    producing_component: Mapped[str] = mapped_column(String(128), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    observed_facts: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class ExecutionClassification(Base):
+    """One immutable deterministic failure finding for a failed attempt."""
+    __tablename__ = "execution_classifications"
+    __table_args__ = (
+        UniqueConstraint("execution_attempt_id", name="uq_execution_classifications_attempt"),
+        ForeignKeyConstraint(
+            ["project_id", "execution_job_id", "execution_attempt_id"],
+            ["execution_attempts.project_id", "execution_attempts.execution_job_id", "execution_attempts.id"],
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("jsonb_typeof(evidence_references) = 'array' AND octet_length(evidence_references::text) <= 4096", name="ck_execution_classifications_evidence"),
+        CheckConstraint("jsonb_typeof(missing_evidence) = 'array' AND octet_length(missing_evidence::text) <= 2048", name="ck_execution_classifications_missing"),
+        CheckConstraint("char_length(classifier_version) > 0 AND char_length(applied_rule_id) > 0", name="ck_execution_classifications_identity"),
+        Index("ix_execution_classifications_attempt", "project_id", "execution_attempt_id"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_attempt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    classifier_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[str] = mapped_column(String(64), nullable=False)
+    applied_rule_id: Mapped[str] = mapped_column(String(16), nullable=False)
+    evidence_references: Mapped[list] = mapped_column(JSONB, nullable=False)
+    missing_evidence: Mapped[list] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
