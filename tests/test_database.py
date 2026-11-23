@@ -669,12 +669,29 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             })[0]
         passed = submit("fixture-pass", "fixture_increment_v1")
         failed = submit("fixture-fail", "fixture_assertion_failure_v1")
+        agent_pass = self.execution_service.submit(administrator, str(project.id), "fixture-agent-pass", {
+            "schema_version": "1.0.0", "deadline_seconds": 30,
+            "orchestration": {"mode": "controlled_fixture_agent", "scenario_id": "fixture_increment_v1"},
+            "browser_target_version_id": target_version.id, "test_definition_version_id": definition.id,
+        })[0]
+        agent_fail = self.execution_service.submit(administrator, str(project.id), "fixture-agent-fail", {
+            "schema_version": "1.0.0", "deadline_seconds": 30,
+            "orchestration": {"mode": "controlled_fixture_agent", "scenario_id": "fixture_assertion_failure_v1"},
+            "browser_target_version_id": target_version.id, "test_definition_version_id": definition.id,
+        })[0]
+        self.assertTrue(worker.process_once())
+        self.assertTrue(worker.process_once())
         self.assertTrue(worker.process_once())
         self.assertTrue(worker.process_once())
         passed_detail, passed_attempt, _ = self.execution_service.detail(administrator, str(project.id), str(passed.id))
         failed_detail, failed_attempt, _ = self.execution_service.detail(administrator, str(project.id), str(failed.id))
         self.assertEqual(("succeeded", "succeeded", "assertion_verified"), (passed_detail.status, passed_attempt.status, passed_attempt.terminal_outcome))
         self.assertEqual(("failed", "failed", "fixture_assertion_failed"), (failed_detail.status, failed_attempt.status, failed_attempt.terminal_outcome))
+        agent_pass_detail, agent_pass_attempt, _ = self.execution_service.detail(administrator, str(project.id), str(agent_pass.id))
+        agent_fail_detail, agent_fail_attempt, _ = self.execution_service.detail(administrator, str(project.id), str(agent_fail.id))
+        self.assertEqual(("succeeded", "succeeded"), (agent_pass_detail.status, agent_pass_attempt.status))
+        self.assertEqual(("failed", "failed", "fixture_assertion_failed"), (agent_fail_detail.status, agent_fail_attempt.status, agent_fail_attempt.terminal_outcome))
+        self.assertGreaterEqual(len(self.execution_service.evidence(administrator, str(project.id), str(agent_pass.id))), 3)
         evidence = self.execution_service.evidence(administrator, str(project.id), str(passed.id))
         self.assertEqual(3, len(evidence))
         self.assertTrue(all(len(record.content_digest) == 64 for record in evidence))

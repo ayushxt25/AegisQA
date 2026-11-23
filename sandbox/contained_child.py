@@ -155,6 +155,69 @@ def _browser_result(scenario: str) -> dict:
         }
 
 
+def _agent_result(raw_request: str) -> dict:
+    """Validate the parent packet again before launching Chromium."""
+    from backend.agent_contracts import AgentContractError, FixtureAgentRequest, FixtureAgentResult
+    from agent_runtime.actions import ActionPolicy
+    from agent_runtime.browser import PlaywrightBrowserTool
+    from agent_runtime.planner import MockPlanner
+    from agent_runtime.runner import AgentRunner
+    from agent_runtime.state import ExecutionState, ExecutionStatus
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+    try:
+        request = FixtureAgentRequest.from_dict(json.loads(raw_request))
+    except (TypeError, ValueError, json.JSONDecodeError, AgentContractError):
+        raise SystemExit(2)
+    started, redirect_blocked = time.monotonic(), False
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True, timeout=min(10_000, request.deadline_ms))
+            try:
+                context = browser.new_context()
+                try:
+                    def route_request(route):
+                        parsed = urlsplit(route.request.url)
+                        if parsed.scheme == "http" and parsed.netloc == "aegisqa-controlled-fixture:8080" and parsed.path in ("/browser", "/redirect"):
+                            route.continue_()
+                        else:
+                            route.abort()
+                    context.route("**/*", route_request)
+                    page = context.new_page()
+                    try:
+                        page.goto(_REDIRECT_URL, wait_until="load", timeout=min(2_000, request.deadline_ms))
+                    except PlaywrightError:
+                        redirect_blocked = True
+                    policy = ActionPolicy(set(request.action_policy["allowed_urls"]), set(request.action_policy["allowed_click_targets"]), set(), set())
+                    expected = "Clicks: 1" if request.scenario_id != "fixture_assertion_failure_v1" else "Clicks: 2"
+                    state = AgentRunner(MockPlanner(_FIXTURE_URL), PlaywrightBrowserTool(page, policy), policy, lambda observation: observation.data.get("result") == expected).run(ExecutionState("controlled fixture assertion", request.action_budget)).state
+                    if request.scenario_id == "fixture_timeout_v1":
+                        while True: time.sleep(0.25)
+                    # A completed false deterministic assertion is authoritative
+                    # over MockPlanner's later finish action.  Runtime failures
+                    # before that observation remain automation failures.
+                    if state.status is ExecutionStatus.BUDGET_EXHAUSTED:
+                        completion, reason = "budget_exhausted", "budget_exhausted"
+                    elif state.assertion_result is True:
+                        completion, reason = "assertion_passed", None
+                    elif state.assertion_result is False:
+                        completion, reason = "assertion_failed", "assertion_failed"
+                    elif state.status is ExecutionStatus.FAILED and state.error and state.error.startswith("Planner finished"):
+                        completion, reason = "finished_without_verified_assertion", "finish_unverified"
+                    else:
+                        completion, reason = "automation_failed", "execution_failed"
+                    observation = state.observations[-1].data if state.observations else {}
+                    payload = {"type": "agent_attempt_result", "schema_version": "1.0", "project_id": request.project_id, "execution_job_id": request.execution_job_id, "execution_attempt_id": request.execution_attempt_id, "scenario_id": request.scenario_id, "completion": completion, "assertion_verified": state.assertion_result is True, "action_count": len(state.action_history), "remaining_action_budget": state.remaining_action_budget, "duration_ms": min(request.deadline_ms, int((time.monotonic() - started) * 1000)), "safe_failure_reason": reason, "actions": [{"kind": record.action.kind.value, "outcome": "executed" if record.outcome == "executed" else "finish_requested" if record.outcome == "finish requested" else "failed"} for record in state.action_history], "observation_summary": {"current_url_approved": observation.get("url") == _FIXTURE_URL, "permitted_element_count": len(observation.get("permitted_elements", []))}}
+                    FixtureAgentResult.from_dict(payload, request)
+                    return payload
+                finally: context.close()
+            finally: browser.close()
+    except Exception:
+        payload = {"type": "agent_attempt_result", "schema_version": "1.0", "project_id": request.project_id, "execution_job_id": request.execution_job_id, "execution_attempt_id": request.execution_attempt_id, "scenario_id": request.scenario_id, "completion": "automation_failed", "assertion_verified": False, "action_count": 0, "remaining_action_budget": request.action_budget, "duration_ms": min(request.deadline_ms, int((time.monotonic() - started) * 1000)), "safe_failure_reason": "execution_failed", "actions": [], "observation_summary": {"current_url_approved": False, "permitted_element_count": 0}}
+        FixtureAgentResult.from_dict(payload, request)
+        return payload
+
+
 def _dns_forbidden(host: str) -> bool:
     try:
         socket.getaddrinfo(host, 5432)
@@ -165,7 +228,7 @@ def _dns_forbidden(host: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("probe", "wait", "fixture_probe", "browser"), required=True)
+    parser.add_argument("--mode", choices=("probe", "wait", "fixture_probe", "browser", "agent_browser"), required=True)
     parser.add_argument("--scenario", choices=_BROWSER_SCENARIOS)
     args = parser.parse_args()
     if args.mode == "wait":
@@ -181,6 +244,12 @@ def main() -> int:
         if args.scenario not in _BROWSER_SCENARIOS:
             return 2
         print(json.dumps(_browser_result(args.scenario), sort_keys=True), flush=True)
+        return 0
+    if args.mode == "agent_browser":
+        raw_request = os.environ.get("AEGISQA_AGENT_REQUEST")
+        if not raw_request:
+            return 2
+        print(json.dumps(_agent_result(raw_request), sort_keys=True), flush=True)
         return 0
     readonly = False
     try:

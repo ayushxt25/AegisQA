@@ -12,8 +12,9 @@ from typing import Optional
 from sqlalchemy import Integer, and_, bindparam, func, or_, select, text, update
 
 from backend.database import DatabaseManager
-from backend.models import BrowserTargetVersion, ExecutionAttempt, ExecutionEvent, ExecutionEvidence, ExecutionJob
+from backend.models import BrowserTargetVersion, ExecutionAttempt, ExecutionEvent, ExecutionEvidence, ExecutionJob, TestDefinitionVersion
 from backend.docker_sandbox import DockerContainmentError, DockerExecutionInterrupted, DockerSandbox, FixtureExecutionRequest
+from backend.agent_contracts import FIXTURE_URL, FixtureAgentRequest
 from failure_intelligence.contracts import EvidenceIdFactory, EvidenceRecord, EvidenceSource
 
 
@@ -157,7 +158,11 @@ class ExecutionWorker:
         return True
 
     def _process_fixture(self, claim: ClaimedAttempt) -> None:
-        request = self._fixture_request(claim)
+        mode = self._fixture_mode(claim)
+        if mode == "controlled_fixture_agent":
+            self._process_fixture_agent(claim)
+            return
+        request = self._fixture_request(claim) if mode == "controlled_fixture" else None
         if request is None:
             self.finalize_failed(claim, "unsupported_execution_contract")
             return
@@ -197,6 +202,49 @@ class ExecutionWorker:
         else:
             self.finalize_failed(claim, "fixture_execution_failed")
 
+    def _process_fixture_agent(self, claim: ClaimedAttempt) -> None:
+        request = self._fixture_agent_request(claim)
+        if request is None:
+            self.finalize_failed(claim, "unsupported_execution_contract")
+            return
+        last_heartbeat = [0.0]
+        def lease_valid() -> bool:
+            now = time.monotonic()
+            if now - last_heartbeat[0] < min(1.0, self._lease_seconds / 3):
+                return True
+            last_heartbeat[0] = now
+            return self.heartbeat(claim)
+        try:
+            result = self._fixture_sandbox.run_agent_fixture(
+                self._fixture_image_id, request, lease_valid=lease_valid,
+                cancellation_requested=lambda: self.cancel_requested(claim),
+            )
+        except DockerExecutionInterrupted as error:
+            if str(error) == "cancelled": self.finalize_cancelled(claim)
+            elif str(error) == "timed_out" or self.deadline_exceeded(claim): self.finalize_timed_out(claim)
+            return
+        except DockerContainmentError:
+            self.finalize_failed(claim, "fixture_infrastructure_failed")
+            return
+        if self.cancel_requested(claim):
+            self.finalize_cancelled(claim)
+        elif self.deadline_exceeded(claim):
+            self.finalize_timed_out(claim)
+        elif result.payload.get("completion") == "assertion_passed" and result.payload.get("assertion_verified") is True:
+            self.finalize_succeeded(claim, self._agent_evidence(claim, request, result.payload))
+        elif result.payload.get("completion") == "assertion_failed":
+            self.finalize_failed(claim, "fixture_assertion_failed", self._agent_evidence(claim, request, result.payload))
+        else:
+            self.finalize_failed(claim, "fixture_execution_failed", self._agent_evidence(claim, request, result.payload))
+
+    def _fixture_mode(self, claim: ClaimedAttempt) -> Optional[str]:
+        with self._database.session_scope() as session:
+            job = session.scalar(select(ExecutionJob).where(ExecutionJob.id == claim.job_id, ExecutionJob.project_id == claim.project_id))
+            if job is None or not isinstance(job.request_snapshot, dict): return None
+            orchestration = job.request_snapshot.get("orchestration")
+            if not isinstance(orchestration, dict) or set(orchestration) != {"mode", "scenario_id"}: return None
+            return orchestration.get("mode")
+
     def _fixture_request(self, claim: ClaimedAttempt) -> Optional[FixtureExecutionRequest]:
         with self._database.session_scope() as session:
             job = session.scalar(select(ExecutionJob).where(
@@ -213,6 +261,31 @@ class ExecutionWorker:
                 return None
             try:
                 return FixtureExecutionRequest("1.0", orchestration.get("scenario_id"), min(30.0, float(job.request_snapshot.get("deadline_seconds", 0))))
+            except (TypeError, ValueError):
+                return None
+
+    def _fixture_agent_request(self, claim: ClaimedAttempt) -> Optional[FixtureAgentRequest]:
+        """Derive a development-only fixed agent packet; never accept one from a client."""
+        with self._database.session_scope() as session:
+            job = session.scalar(select(ExecutionJob).where(ExecutionJob.id == claim.job_id, ExecutionJob.project_id == claim.project_id))
+            if job is None or job.request_schema_version != "1.0.0" or job.browser_target_version_id is None or job.test_definition_version_id is None:
+                return None
+            target = session.scalar(select(BrowserTargetVersion).where(BrowserTargetVersion.id == job.browser_target_version_id, BrowserTargetVersion.project_id == claim.project_id, BrowserTargetVersion.approval_state == "approved"))
+            definition = session.scalar(select(TestDefinitionVersion).where(TestDefinitionVersion.id == job.test_definition_version_id, TestDefinitionVersion.project_id == claim.project_id))
+            orchestration = job.request_snapshot.get("orchestration") if isinstance(job.request_snapshot, dict) else None
+            if target is None or definition is None or not isinstance(orchestration, dict) or orchestration.get("mode") != "controlled_fixture_agent":
+                return None
+            try:
+                # Fixture policy is a trusted development capability, separate from
+                # P1.5-A HTTPS target policy; target/version IDs remain immutable bindings.
+                return FixtureAgentRequest.from_dict({
+                    "schema_version": "1.0", "project_id": str(claim.project_id), "execution_job_id": str(claim.job_id), "execution_attempt_id": str(claim.attempt_id),
+                    "browser_target_version_id": str(target.id), "test_definition_version_id": str(definition.id),
+                    "fixture_identity": "aegisqa-controlled-fixture", "allowed_origin": "http://aegisqa-controlled-fixture:8080",
+                    "scenario_id": orchestration.get("scenario_id"), "action_budget": 3, "model_call_budget": 0,
+                    "deadline_ms": min(30_000, int(float(job.request_snapshot.get("deadline_seconds", 0)) * 1000)),
+                    "action_policy": {"allowed_urls": [FIXTURE_URL], "allowed_click_targets": ["#increment"], "allowed_fill_targets": [], "allowed_inspect_targets": []},
+                })
             except (TypeError, ValueError):
                 return None
 
@@ -233,6 +306,22 @@ class ExecutionWorker:
                 "status": "assertion_passed" if payload.get("assertion_verified") else "assertion_failed",
             }),
         )
+
+    def _agent_evidence(self, claim: ClaimedAttempt, request: FixtureAgentRequest, payload: dict):
+        """Parent converts only already validated B1 summaries into Phase 0 evidence."""
+        factory = EvidenceIdFactory(run_id=str(claim.attempt_id))
+        summary = payload.get("observation_summary", {})
+        records = [factory.create(EvidenceSource.OBSERVATION, "sandbox.playwright", {
+            "url": FIXTURE_URL, "permitted_elements": summary.get("permitted_element_count", 0),
+        })]
+        for action in payload.get("actions", ()):  # B1 parent validation bounds this list.
+            records.append(factory.create(EvidenceSource.ACTION, "sandbox.playwright", {
+                "action_kind": action.get("kind"), "outcome": action.get("outcome"), "duration_ms": payload.get("duration_ms", 0),
+            }))
+        records.append(factory.create(EvidenceSource.EXECUTION_LOG, "assertion", {
+            "status": "assertion_passed" if payload.get("assertion_verified") else "assertion_failed",
+        }))
+        return tuple(records)
 
     def _classify_failed_attempt(self, claim: ClaimedAttempt) -> None:
         """Classification is advisory and cannot alter a committed execution outcome."""

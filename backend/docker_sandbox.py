@@ -16,6 +16,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
+from backend.agent_contracts import AgentContractError, FixtureAgentRequest, FixtureAgentResult
+
 
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NAME = re.compile(r"^aegisqa-sandbox-[0-9a-f]{24}$")
@@ -217,6 +219,38 @@ class DockerSandbox:
             self._remove_network(network)
             self._remove_network(unapproved_network)
 
+    def run_agent_fixture(
+        self, fixture_image_id: str, request: FixtureAgentRequest,
+        lease_valid: Optional[Callable[[], bool]] = None,
+        cancellation_requested: Optional[Callable[[], bool]] = None,
+    ) -> DockerSandboxResult:
+        """Run the bounded MockPlanner path; request/result remain parent-validated."""
+        if not isinstance(request, FixtureAgentRequest) or not _IMAGE_ID.fullmatch(fixture_image_id):
+            raise ValueError("fixture agent request or image is invalid")
+        try:
+            request = FixtureAgentRequest.from_dict(request.to_dict())
+        except AgentContractError as error:
+            raise DockerContainmentError("fixture agent request is invalid") from error
+        suffix = uuid.uuid4().hex[:24]
+        network, unapproved_network = "aegisqa-fixture-network-" + suffix, "aegisqa-fixture-network-" + uuid.uuid4().hex[:24]
+        fixture, unapproved, sandbox = "aegisqa-fixture-" + suffix, "aegisqa-fixture-" + uuid.uuid4().hex[:24], "aegisqa-sandbox-" + suffix
+        started = time.monotonic()
+        try:
+            self.verify(); self._verify_image(fixture_image_id)
+            self._create_internal_network(network); self._create_internal_network(unapproved_network)
+            self._start_fixture(fixture, fixture_image_id, network, _FIXTURE_ALIAS)
+            self._start_fixture(unapproved, fixture_image_id, unapproved_network, _UNAPPROVED_ALIAS)
+            self._start(sandbox, "agent_browser", network=network, agent_request=request)
+            self._verify_effective(sandbox, network); self._verify_network_members(network, (fixture, sandbox))
+            exit_code = self._wait_for_browser(sandbox, request.deadline_ms / 1000.0, lease_valid, cancellation_requested)
+            if exit_code != "0":
+                raise DockerContainmentError("agent browser sandbox exited abnormally")
+            payload = _parse_agent_result(self._run(["logs", "--tail", "1", sandbox], timeout=5).stdout, request)
+            return DockerSandboxResult(sandbox, payload, time.monotonic() - started)
+        finally:
+            self.remove(sandbox); self._remove_fixture(fixture); self._remove_fixture(unapproved)
+            self._remove_network(network); self._remove_network(unapproved_network)
+
     def _wait_for_browser(self, name: str, timeout_seconds: float, lease_valid, cancellation_requested) -> str:
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -240,14 +274,16 @@ class DockerSandbox:
             raise ValueError("refusing to remove a non-sandbox container")
         self._remove_owned_container(name)
 
-    def _start(self, name: str, mode: str, network: str = "none", scenario: Optional[str] = None) -> None:
+    def _start(self, name: str, mode: str, network: str = "none", scenario: Optional[str] = None, agent_request: Optional[FixtureAgentRequest] = None) -> None:
         if mode not in ("probe", "wait") or not _NAME.fullmatch(name):
-            if mode not in ("fixture_probe", "browser") or not _NAME.fullmatch(name) or not _NETWORK_NAME.fullmatch(network):
+            if mode not in ("fixture_probe", "browser", "agent_browser") or not _NAME.fullmatch(name) or not _NETWORK_NAME.fullmatch(network):
                 raise DockerContainmentError("invalid fixed sandbox workload")
         if mode == "browser" and scenario not in _BROWSER_SCENARIOS:
             raise DockerContainmentError("invalid fixed browser scenario")
         if mode != "browser" and scenario is not None:
             raise DockerContainmentError("unexpected sandbox scenario")
+        if (mode == "agent_browser") != (agent_request is not None):
+            raise DockerContainmentError("invalid fixed agent workload")
         if network != "none" and not _NETWORK_NAME.fullmatch(network):
             raise DockerContainmentError("invalid fixed sandbox workload")
         args = [
@@ -257,8 +293,11 @@ class DockerSandbox:
             "--user", "65532:65532", "--security-opt", "no-new-privileges:true",
             "--cap-drop", "ALL", "--pids-limit", str(self._limits.pids_limit),
             "--memory", str(self._limits.memory_bytes), "--cpus", str(self._limits.cpu_count),
-            "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "HOME=/tmp", self._image_id, "--mode", mode,
+            "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "HOME=/tmp",
         ]
+        if agent_request is not None:
+            args.extend(["--env", "AEGISQA_AGENT_REQUEST=" + json.dumps(agent_request.to_dict(), sort_keys=True, separators=(",", ":"))])
+        args.extend([self._image_id, "--mode", mode])
         if scenario is not None:
             args.extend(["--scenario", scenario])
         self._run(args, timeout=10)
@@ -438,6 +477,21 @@ def _parse_browser_result(output: str, request: FixtureExecutionRequest) -> Dict
     if not valid:
         raise DockerContainmentError("browser sandbox returned an unexpected message")
     return value
+
+
+def _parse_agent_result(output: str, request: FixtureAgentRequest) -> Dict[str, object]:
+    try:
+        value = json.loads(output.strip())
+        result = FixtureAgentResult.from_dict(value, request)
+    except (TypeError, ValueError, json.JSONDecodeError, AgentContractError) as error:
+        raise DockerContainmentError("agent browser sandbox returned an invalid result") from error
+    # Parent returns only the validated bounded shape; it is still not durable success.
+    return {
+        "completion": result.completion, "assertion_verified": result.assertion_verified,
+        "action_count": result.action_count, "remaining_action_budget": result.remaining_action_budget,
+        "duration_ms": result.duration_ms, "safe_failure_reason": result.safe_failure_reason,
+        "actions": list(result.actions), "observation_summary": result.observation_summary,
+    }
 
 
 _NETWORK_PROBES = (

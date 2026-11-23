@@ -3,8 +3,21 @@ from __future__ import annotations
 
 import os
 import unittest
+import uuid
 
-from backend.docker_sandbox import DockerExecutionInterrupted, DockerSandbox, DockerSandboxLimits, FixtureExecutionRequest
+from backend.agent_contracts import FIXTURE_ORIGIN, FIXTURE_URL, FixtureAgentRequest
+from backend.docker_sandbox import DockerContainmentError, DockerExecutionInterrupted, DockerSandbox, DockerSandboxLimits, FixtureExecutionRequest, _parse_agent_result
+
+
+def _agent_request(scenario="fixture_increment_v1", budget=3):
+    ids = [str(uuid.uuid4()) for _ in range(5)]
+    return FixtureAgentRequest.from_dict({
+        "schema_version": "1.0", "project_id": ids[0], "execution_job_id": ids[1], "execution_attempt_id": ids[2],
+        "browser_target_version_id": ids[3], "test_definition_version_id": ids[4],
+        "fixture_identity": "aegisqa-controlled-fixture", "allowed_origin": FIXTURE_ORIGIN,
+        "scenario_id": scenario, "action_budget": budget, "model_call_budget": 0, "deadline_ms": 30000,
+        "action_policy": {"allowed_urls": [FIXTURE_URL], "allowed_click_targets": ["#increment"], "allowed_fill_targets": [], "allowed_inspect_targets": []},
+    })
 
 
 class DockerSandboxUnitTests(unittest.TestCase):
@@ -20,6 +33,16 @@ class DockerSandboxUnitTests(unittest.TestCase):
             DockerSandboxLimits(pids_limit=1)
         with self.assertRaises(ValueError):
             FixtureExecutionRequest("1.0", "arbitrary_url")
+
+    def test_agent_parent_rejects_invalid_request_and_malformed_result_before_dispatch(self):
+        valid = _agent_request()
+        malformed = {"type": "agent_attempt_result"}
+        with self.assertRaises(DockerContainmentError):
+            _parse_agent_result("{}".format(malformed), valid)
+        bad = FixtureAgentRequest(valid.project_id, valid.execution_job_id, valid.execution_attempt_id, valid.browser_target_version_id, valid.test_definition_version_id, valid.scenario_id, 0, valid.deadline_ms, valid.action_policy)
+        sandbox = DockerSandbox("sha256:" + "a" * 64, docker_binary="docker")
+        with self.assertRaises(DockerContainmentError):
+            sandbox.run_agent_fixture("sha256:" + "a" * 64, bad)
 
 
 @unittest.skipUnless(os.environ.get("AEGISQA_RUN_DOCKER_CONTAINMENT_TESTS") == "true", "set AEGISQA_RUN_DOCKER_CONTAINMENT_TESTS=true")
@@ -79,6 +102,21 @@ class DockerSandboxIntegrationTests(unittest.TestCase):
         failed = self.sandbox.run_playwright_fixture(fixture, FixtureExecutionRequest("1.0", "fixture_assertion_failure_v1", 20.0))
         self.assertEqual("assertion_failed", failed.payload["outcome"])
         self.assertFalse(failed.payload["assertion_verified"])
+
+    def test_agent_browser_runs_mockplanner_with_bounded_contract(self):
+        fixture = os.environ.get("AEGISQA_FIXTURE_IMAGE_ID", "")
+        if not fixture:
+            self.skipTest("set AEGISQA_FIXTURE_IMAGE_ID to the locally built sha256 fixture image ID")
+        passed = self.sandbox.run_agent_fixture(fixture, _agent_request())
+        self.assertEqual("assertion_passed", passed.payload["completion"])
+        self.assertTrue(passed.payload["assertion_verified"])
+        self.assertEqual(2, passed.payload["action_count"])
+        failed = self.sandbox.run_agent_fixture(fixture, _agent_request("fixture_assertion_failure_v1"))
+        self.assertEqual("assertion_failed", failed.payload["completion"])
+        self.assertFalse(failed.payload["assertion_verified"])
+        exhausted = self.sandbox.run_agent_fixture(fixture, _agent_request(budget=1))
+        self.assertEqual("budget_exhausted", exhausted.payload["completion"])
+        self.assertEqual("", self.sandbox._run(["ps", "--all", "--filter", "label=com.aegisqa.owner=fixture-boundary", "--format", "{{.Names}}"], timeout=5).stdout.strip())
 
     def test_playwright_timeout_removes_owned_resources(self):
         fixture = os.environ.get("AEGISQA_FIXTURE_IMAGE_ID", "")
